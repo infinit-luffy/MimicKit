@@ -1,0 +1,26 @@
+out_dir: "output/deepmimic_humanoid_continual"
+
+env_config: "data/envs/deepmimic_humanoid_env.yaml"
+agent_config: "data/agents/deepmimic_humanoid_ppo_agent.yaml"
+
+logger: "tb"
+num_envs: 4096
+visualize: False
+video: False
+save_int_models: False
+
+stages:
+  - name: "walk"
+    max_samples: 8000000
+    env_overrides:
+      motion_file: "data/motions/humanoid/humanoid_walk.pkl"
+
+  - name: "run"
+    max_samples: 8000000
+    env_overrides:
+      motion_file: "data/motions/humanoid/humanoid_run.pkl"
+
+  - name: "locomotion_mix"
+    max_samples: 12000000
+    env_overrides:
+      motion_file: "data/datasets/dataset_humanoid_locomotion.yaml"

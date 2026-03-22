@@ -4,6 +4,9 @@ import shutil
 import sys
 import time
 
+import util.rsl_rl_util as rsl_rl_util
+rsl_rl_util.configure_rsl_rl_path()
+
 import envs.env_builder as env_builder
 import learning.agent_builder as agent_builder
 import util.arg_parser as arg_parser

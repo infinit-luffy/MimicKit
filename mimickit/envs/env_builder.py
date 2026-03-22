@@ -7,6 +7,16 @@ from util.logger import Logger
 
 def build_env(env_file, engine_file, num_envs, device, visualize, record_video=False):
     env_config, engine_config = load_configs(env_file, engine_file)
+    env = build_env_from_config(env_config=env_config,
+                                engine_config=engine_config,
+                                num_envs=num_envs,
+                                device=device,
+                                visualize=visualize,
+                                record_video=record_video)
+    return env
+
+def build_env_from_config(env_config, engine_config, num_envs, device, visualize, record_video=False):
+    assert(env_config is not None), "Environment config is required"
 
     env_name = env_config["env_name"]
     Logger.print("Building {} env".format(env_name))

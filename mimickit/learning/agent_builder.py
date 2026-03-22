@@ -5,8 +5,17 @@ from util.logger import Logger
 def build_agent(agent_file, env, device):
     if (agent_file is None or agent_file == ""):
         agent_name = "Dummy"
+        agent_config = None
     else:
         agent_config = load_agent_file(agent_file)
+    
+    agent = build_agent_from_config(agent_config, env, device)
+    return agent
+
+def build_agent_from_config(agent_config, env, device):
+    if (agent_config is None):
+        agent_name = "Dummy"
+    else:
         agent_name = agent_config["agent_name"]
 
     Logger.print("Building {} agent".format(agent_name))

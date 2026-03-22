@@ -1,0 +1,7 @@
+--mode train
+--num_envs 4096
+--engine_config data/engines/isaac_gym_engine.yaml
+--curriculum_config data/curricula/deepmimic_humanoid_continual.yaml
+--visualize false
+--logger tb
+--out_dir output/deepmimic_humanoid_continual

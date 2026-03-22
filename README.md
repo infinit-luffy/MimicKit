@@ -15,6 +15,7 @@ Instructions for each method are available here:
 - [ASE - Adversarial Skill Embeddings](docs/README_ASE.md)
 - [LCP - Lipschitz-Constrained Policies](docs/README_LCP.md)
 - [ADD - Adversarial Differential Discriminator](docs/README_ADD.md)
+- [Continual / Sequential Training](docs/README_Continual.md)
 
 ---
 
@@ -96,6 +97,19 @@ To use distributed training with multi-CPU or multi-GPU:
 python mimickit/run.py --arg_file args/deepmimic_humanoid_ppo_args.txt --devices cuda:0 cuda:1
 ``` 
 - `--devices` specifies the devices used for training, which can be `cpu` or `cuda:{i}`. Multiple devices can be provided to parallelize training across multiple processes.
+
+
+## Continual Training
+
+For continual or stage-wise motion imitation training, use [`mimickit/continual_run.py`](mimickit/continual_run.py) with a curriculum file that lists sequential stages:
+```
+python mimickit/continual_run.py --arg_file args/deepmimic_humanoid_continual_args.txt
+```
+- Each stage can override `motion_file`, agent hyperparameters, engine settings, and sample budget without duplicating the original config files.
+- The final checkpoint of each stage is automatically used to initialize the next stage.
+- A merged `env_config.yaml`, `agent_config.yaml`, `engine_config.yaml`, and `stage_info.yaml` will be saved in each stage output directory for reproducibility.
+- A reference curriculum is provided in [`data/curricula/deepmimic_humanoid_continual.yaml`](data/curricula/deepmimic_humanoid_continual.yaml).
+- The training entry scripts automatically prepend the local [`third_party/rsl_rl`](third_party/rsl_rl/) path to `sys.path`. This can be overridden with the `RSL_RL_ROOT` environment variable.
 
 
 ## Visualizer UI
