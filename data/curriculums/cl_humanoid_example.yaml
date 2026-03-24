@@ -11,7 +11,7 @@ out_dir: "output/cl_humanoid"
 
 env_config: "data/envs/amp_humanoid_env.yaml"
 agent_config: "data/agents/amp_cl_humanoid_agent.yaml"
-engine_config: "data/engines/newton_engine.yaml"
+engine_config: "data/engines/isaac_gym_engine.yaml"
 
 max_samples: 50000000
 num_envs: 4096

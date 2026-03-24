@@ -21,7 +21,6 @@ import numpy as np
 import os
 import sys
 import time
-import torch
 import yaml
 
 import util.rsl_rl_util as rsl_rl_util
@@ -34,6 +33,8 @@ import continual_run as cl_base
 import run as run_lib
 from util.logger import Logger
 import util.mp_util as mp_util
+
+import torch
 
 
 def build_run_dir(base_out_dir, agent_name, rand_seed):
