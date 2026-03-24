@@ -1,0 +1,67 @@
+## Continual Learning Curriculum: Humanoid 10-Motion Sequential Learning
+##
+## Usage:
+##   cd mimickit
+##   python cl_run.py --curriculum_config data/curriculums/cl_humanoid_example.yaml
+##
+## 10 diverse motions: locomotion → combat → acrobatics → dance → ground
+## Between stages, SGP features protect previously learned subspaces.
+
+out_dir: "output/cl_humanoid"
+
+env_config: "data/envs/amp_humanoid_env.yaml"
+agent_config: "data/agents/amp_cl_humanoid_agent.yaml"
+engine_config: "data/engines/newton_engine.yaml"
+
+max_samples: 50000000
+num_envs: 4096
+logger: "tb"
+save_int_models: True
+visualize: False
+
+stages:
+  # --- Locomotion ---
+  - name: "walk"
+    env_overrides:
+      motion_file: "data/motions/humanoid/humanoid_walk.pkl"
+
+  - name: "run"
+    env_overrides:
+      motion_file: "data/motions/humanoid/humanoid_run.pkl"
+
+  # --- Combat ---
+  - name: "punch"
+    env_overrides:
+      motion_file: "data/motions/humanoid/humanoid_punch.pkl"
+
+  - name: "kick"
+    env_overrides:
+      motion_file: "data/motions/humanoid/humanoid_kick.pkl"
+
+  # --- Acrobatics ---
+  - name: "backflip"
+    env_overrides:
+      motion_file: "data/motions/humanoid/humanoid_backflip.pkl"
+
+  - name: "cartwheel"
+    env_overrides:
+      motion_file: "data/motions/humanoid/humanoid_cartwheel.pkl"
+
+  - name: "sideflip"
+    env_overrides:
+      motion_file: "data/motions/humanoid/humanoid_sideflip.pkl"
+
+  # --- Dance ---
+  - name: "dance"
+    env_overrides:
+      motion_file: "data/motions/humanoid/humanoid_dance_a.pkl"
+
+  - name: "spin"
+    env_overrides:
+      motion_file: "data/motions/humanoid/humanoid_spin.pkl"
+
+  # --- Ground ---
+  - name: "crawl"
+    env_overrides:
+      motion_file: "data/motions/humanoid/humanoid_crawl.pkl"
+      contact_bodies: []

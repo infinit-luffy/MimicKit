@@ -20,7 +20,7 @@ class MPOptimizer():
     def step(self, loss):
         self._optimizer.zero_grad()
         loss.backward()
-        
+
         if (mp_util.enable_mp()):
             self._aggregate_mp_grads()
 
@@ -28,7 +28,38 @@ class MPOptimizer():
             self._clip_grads(self._grad_clip)
 
         self._optimizer.step()
-        
+
+        if (mp_util.enable_mp() and (self.get_steps() % self.CHECK_SYNC_STEPS == 0)):
+            assert(self._check_synced()), "Network parameters desynchronized"
+
+        self._steps += 1
+        return
+
+    def step_with_grad_hook(self, loss, pre_step_fn=None):
+        """Like step(), but calls pre_step_fn after backward (before optimizer step).
+
+        Used by continual learning to inject SGP gradient projection between
+        loss.backward() and optimizer.step().
+
+        Args:
+            loss: The loss tensor to backpropagate.
+            pre_step_fn: Optional callable invoked after backward + grad aggregation,
+                         before grad clipping and optimizer step.
+        """
+        self._optimizer.zero_grad()
+        loss.backward()
+
+        if (mp_util.enable_mp()):
+            self._aggregate_mp_grads()
+
+        if (pre_step_fn is not None):
+            pre_step_fn()
+
+        if (self._enable_grad_clip()):
+            self._clip_grads(self._grad_clip)
+
+        self._optimizer.step()
+
         if (mp_util.enable_mp() and (self.get_steps() % self.CHECK_SYNC_STEPS == 0)):
             assert(self._check_synced()), "Network parameters desynchronized"
 

@@ -41,6 +41,9 @@ def build_agent_from_config(agent_config, env, device):
     elif (agent_name == "LCP"):
         import learning.lcp_agent as lcp_agent
         agent = lcp_agent.LCPAgent(config=agent_config, env=env, device=device)
+    elif (agent_name == "AMP_CL"):
+        import learning.cl.amp_cl_agent as amp_cl_agent
+        agent = amp_cl_agent.AMPCLAgent(config=agent_config, env=env, device=device)
     else:
         assert(False), "Unsupported agent: {}".format(agent_name)
 
