@@ -132,21 +132,21 @@ def evaluate_motion(agent, env, motion_id, num_episodes=10):
     return result
 
 
-def train_cl_stage(stage_config, task_id, device, in_model_file, sgp_mem,
-                   prev_signature, curriculum_file):
-    """Train one CL stage (one motion).
+def train_cl_stage(env, stage_config, task_id, device, in_model_file, sgp_mem,
+                   curriculum_file):
+    """Train one CL stage (one motion), reusing the existing env.
 
     Args:
+        env: Reusable environment instance (motion is swapped, not recreated).
         stage_config: Stage configuration dict from build_stage_config.
         task_id: Integer task ID for this motion.
         device: Torch device.
         in_model_file: Path to previous stage's model checkpoint.
         sgp_mem: SGPMemoryBank instance.
-        prev_signature: Previous env signature for compatibility check.
         curriculum_file: Path to curriculum config file.
 
     Returns:
-        (out_model_file, curr_signature, stage_record)
+        (out_model_file, stage_record)
     """
     stage_name = stage_config["name"]
     Logger.print("")
@@ -158,27 +158,15 @@ def train_cl_stage(stage_config, task_id, device, in_model_file, sgp_mem,
     cl_base.save_stage_files(stage_config, curriculum_file=curriculum_file,
                              in_model_file=in_model_file)
 
-    # A. Build environment
-    env = env_builder.build_env_from_config(
-        env_config=stage_config["env_config"],
-        engine_config=stage_config["engine_config"],
-        num_envs=stage_config["num_envs"],
-        device=device,
-        visualize=stage_config["visualize"],
-        record_video=stage_config["record_video"]
-    )
+    # A. Swap motion file on the existing env (no engine recreation)
+    motion_file = stage_config["env_config"]["motion_file"]
+    Logger.print("Loading motion: {}".format(motion_file))
+    env._load_motions(motion_file)
 
     # B. Build agent (AMP_CL)
     agent = agent_builder.build_agent_from_config(
         stage_config["agent_config"], env, device
     )
-
-    # Verify env compatibility
-    curr_signature = cl_base.calc_env_signature(env)
-    if prev_signature is not None:
-        assert curr_signature == prev_signature, \
-            "Stage {} changed obs/action spaces: {} vs {}".format(
-                stage_name, curr_signature, prev_signature)
 
     # C. Load previous model + inject CL state
     if task_id > 0 and in_model_file != "":
@@ -233,14 +221,14 @@ def train_cl_stage(stage_config, task_id, device, in_model_file, sgp_mem,
         "max_samples": int(stage_config["max_samples"])
     }
 
-    # Cleanup
-    del env, agent
+    # Cleanup agent only (env is reused)
+    del agent
     torch.cuda.empty_cache()
 
-    return out_model_file, curr_signature, stage_record
+    return out_model_file, stage_record
 
 
-def evaluate_all_motions(stages, final_model_file, sgp_mem, device,
+def evaluate_all_motions(env, stages, final_model_file, device,
                          curriculum, args):
     """Evaluate retention on all learned motions using the final model."""
     Logger.print("")
@@ -253,14 +241,9 @@ def evaluate_all_motions(stages, final_model_file, sgp_mem, device,
         stage_config = cl_base.build_stage_config(task_id, stage, curriculum, args)
         stage_name = stage_config["name"]
 
-        env = env_builder.build_env_from_config(
-            env_config=stage_config["env_config"],
-            engine_config=stage_config["engine_config"],
-            num_envs=stage_config["num_envs"],
-            device=device,
-            visualize=False,
-            record_video=False
-        )
+        # Swap motion on the shared env
+        motion_file = stage_config["env_config"]["motion_file"]
+        env._load_motions(motion_file)
 
         agent = agent_builder.build_agent_from_config(
             stage_config["agent_config"], env, device
@@ -273,7 +256,7 @@ def evaluate_all_motions(stages, final_model_file, sgp_mem, device,
         Logger.print("  Task {} ({}): mean_return={:.2f}, mean_ep_len={:.2f}".format(
             task_id, stage_name, result["mean_return"], result["mean_ep_len"]))
 
-        del env, agent
+        del agent
         torch.cuda.empty_cache()
 
     return results
@@ -324,7 +307,21 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
         Logger.print("Loaded SGP memory from {} ({} tasks)".format(
             sgp_memory_file, len(sgp_mem.memory_bank)))
 
-    # Override stage out_dirs to go under curriculum_out_dir
+    # Build env ONCE using the first stage's config (IsaacGym PhysX Foundation
+    # is a singleton — cannot be destroyed and recreated within a process).
+    # Between stages, only the motion file is swapped via env._load_motions().
+    first_stage = stages[start_stage]
+    first_stage_config = cl_base.build_stage_config(start_stage, first_stage, curriculum, args)
+    Logger.print("Building environment (shared across all stages)...")
+    env = env_builder.build_env_from_config(
+        env_config=first_stage_config["env_config"],
+        engine_config=first_stage_config["engine_config"],
+        num_envs=first_stage_config["num_envs"],
+        device=device,
+        visualize=first_stage_config["visualize"],
+        record_video=first_stage_config["record_video"]
+    )
+
     # Train each motion stage sequentially
     for stage_idx in range(start_stage, end_stage + 1):
         stage = stages[stage_idx]
@@ -337,13 +334,13 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
             curriculum_out_dir, "stage_{:02d}_{}".format(stage_idx, stage_name)
         )
 
-        out_model_file, prev_signature, stage_record = train_cl_stage(
+        out_model_file, stage_record = train_cl_stage(
+            env=env,
             stage_config=stage_config,
             task_id=task_id,
             device=device,
             in_model_file=in_model_file,
             sgp_mem=sgp_mem,
-            prev_signature=prev_signature,
             curriculum_file=curriculum_config_file
         )
 
@@ -355,8 +352,8 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
     eval_results = None
     if not skip_eval:
         eval_results = evaluate_all_motions(
-            stages[:end_stage + 1], in_model_file,
-            sgp_mem, device, curriculum, args
+            env, stages[:end_stage + 1], in_model_file,
+            device, curriculum, args
         )
         save_evaluation_results(curriculum_out_dir, eval_results)
 
