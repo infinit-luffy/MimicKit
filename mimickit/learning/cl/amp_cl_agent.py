@@ -357,6 +357,8 @@ class AMPCLAgent(amp_agent.AMPAgent):
             return
 
         kk = 0
+        self._sgp_call_count = getattr(self, '_sgp_call_count', 0) + 1
+
         for name, param in self._model._actor_layers.named_parameters():
             if "weight" in name and param.dim() > 1:
                 if kk >= len(self._sgp_feature_mats):
@@ -370,8 +372,17 @@ class AMPCLAgent(amp_agent.AMPAgent):
 
                     sz = param.grad.data.size(0)
                     flat_grad = param.grad.data.view(sz, -1)
+
+                    grad_norm_before = flat_grad.norm().item()
                     proj = torch.mm(flat_grad, P)
+                    proj_norm = proj.norm().item()
                     param.grad.data = param.grad.data - proj.view(param.grad.shape)
+                    grad_norm_after = param.grad.data.norm().item()
+
+                    # Log every 100 calls
+                    if self._sgp_call_count % 100 == 1:
+                        print("[SGP proj] layer={} P_shape={} grad_before={:.4f} projected={:.4f} grad_after={:.4f}".format(
+                            name, list(P.shape), grad_norm_before, proj_norm, grad_norm_after))
 
                 kk += 1
 
@@ -466,6 +477,15 @@ class AMPCLAgent(amp_agent.AMPAgent):
         # 2. Store SGP projection matrices and anchors
         self._sgp_feature_mats = sgp_feature_mats
         self._sgp_anchors = sgp_anchors
+        self._sgp_call_count = 0
+
+        num_valid = sum(1 for p in sgp_feature_mats if p is not None)
+        Logger.print("SGP: {} projection matrices loaded ({} valid)".format(
+            len(sgp_feature_mats), num_valid))
+        for i, P in enumerate(sgp_feature_mats):
+            if P is not None:
+                Logger.print("  P[{}]: shape={}, rank~={}".format(
+                    i, list(P.shape), (P.diagonal() > 0.5).sum().item()))
 
         # 3. Reset discriminator for new motion
         self._reset_discriminator()

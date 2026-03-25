@@ -97,6 +97,7 @@ class SGPMemoryBank:
         current_task_features = []
         for name in linear_names:
             if name not in activations:
+                print("[SGP extract] Layer {}: NO activations captured!".format(name))
                 current_task_features.append(None)
                 continue
 
@@ -112,6 +113,8 @@ class SGPMemoryBank:
 
             basis_U = U[:, :k]
             current_task_features.append(basis_U)
+            print("[SGP extract] Layer {}: activations={}, dim={}, k={}/{} (threshold={})".format(
+                name, list(R.shape), G.shape[0], k, G.shape[0], self.threshold))
 
         return current_task_features
 
@@ -153,6 +156,8 @@ class SGPMemoryBank:
             # Build projection matrix P = U @ U^T
             P = torch.mm(U_final, U_final.t())
             projection_matrices.append(P)
+            print("[SGP build_P] Layer {}: P shape={}, rank={}/{} (from {} tasks)".format(
+                layer_idx, list(P.shape), U_final.shape[1], P.shape[0], len(history_Us)))
 
         return projection_matrices
 
