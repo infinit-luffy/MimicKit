@@ -486,7 +486,10 @@ class AMPCLAgent(amp_agent.AMPAgent):
             for cbp_mod in self._cbp_modules:
                 cbp_mod.set_task_id(task_id)
 
-        # 2. Store SGP projection matrices and anchors
+        # 2. Freeze bias parameters in actor (SGP only protects weights)
+        self._freeze_actor_bias()
+
+        # 3. Store SGP projection matrices and anchors
         self._sgp_feature_mats = sgp_feature_mats
         self._sgp_anchors = sgp_anchors
         self._sgp_call_count = 0
@@ -499,13 +502,38 @@ class AMPCLAgent(amp_agent.AMPAgent):
                 Logger.print("  P[{}]: shape={}, rank~={}".format(
                     i, list(P.shape), (P.diagonal() > 0.5).sum().item()))
 
-        # 3. Reset discriminator for new motion
+        # 4. Reset discriminator for new motion
         self._reset_discriminator()
 
-        # 4. Update motion embedding
+        # 5. Update motion embedding
         self.set_current_motion(task_id)
 
         Logger.print("CL task {} preparation complete".format(task_id))
+        return
+
+    def _freeze_actor_bias(self):
+        """Freeze all bias parameters in actor hidden layers and output head.
+
+        SGP projects weight gradients but cannot protect bias. Freezing bias
+        after the first task prevents drift that would corrupt learned motions.
+        """
+        frozen_count = 0
+        for name, param in self._model._actor_layers.named_parameters():
+            if "bias" in name:
+                param.requires_grad = False
+                frozen_count += 1
+
+        for name, param in self._model._action_dist.named_parameters():
+            if "bias" in name:
+                param.requires_grad = False
+                frozen_count += 1
+
+        Logger.print("Frozen {} actor bias parameters for CL protection".format(frozen_count))
+
+        # Rebuild actor optimizer without frozen params
+        actor_config = self._config["actor_optimizer"]
+        actor_params = [p for p in self._model.get_actor_params() if p.requires_grad]
+        self._actor_optimizer = mp_optimizer.MPOptimizer(actor_config, actor_params)
         return
 
     def _reset_discriminator(self):

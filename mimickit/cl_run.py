@@ -101,6 +101,119 @@ def save_evaluation_results(out_dir, results):
     Logger.print("Evaluation results saved to {}".format(eval_path))
 
 
+def evaluate_after_stage(env, stages, current_stage_idx, model_file, device,
+                         curriculum, args, num_episodes=10):
+    """Evaluate all learned tasks after completing a training stage.
+
+    Returns a dict mapping task names to mean_ep_len values.
+    This is one row of the performance matrix R[current_stage_idx, :].
+    """
+    Logger.print("")
+    Logger.print("--- Eval after stage {} ({}) on tasks 0..{} ---".format(
+        current_stage_idx, stages[current_stage_idx].get("name", ""),
+        current_stage_idx))
+
+    row = {}
+    for task_id in range(current_stage_idx + 1):
+        stage = stages[task_id]
+        stage_config = cl_base.build_stage_config(task_id, stage, curriculum, args)
+        stage_name = stage_config["name"]
+
+        motion_file = stage_config["env_config"]["motion_file"]
+        env._load_motions(motion_file)
+
+        agent = agent_builder.build_agent_from_config(
+            stage_config["agent_config"], env, device
+        )
+        agent.load(model_file)
+
+        result = evaluate_motion(agent, env, task_id, num_episodes=num_episodes)
+        ep_len = float(result.get("mean_ep_len", 0.0))
+        row[stage_name] = ep_len
+
+        Logger.print("  task {} ({}): mean_ep_len={:.1f}".format(
+            task_id, stage_name, ep_len))
+
+        del agent
+        torch.cuda.empty_cache()
+
+    return row
+
+
+def compute_cl_metrics(perf_matrix, stage_names):
+    """Compute standard CL metrics from the performance matrix.
+
+    Args:
+        perf_matrix: list[dict], where perf_matrix[i][name] = mean_ep_len
+                     after training stage i on task 'name'.
+        stage_names: list of stage name strings in order.
+
+    Returns:
+        dict with AP, BWT, Forgetting metrics.
+    """
+    K = len(perf_matrix) - 1  # last training stage index
+    if K < 0:
+        return {}
+
+    last_row = perf_matrix[K]
+
+    # AP: Average Performance on all tasks using final model
+    ap_values = [last_row.get(name, 0.0) for name in stage_names[:K + 1]]
+    ap = sum(ap_values) / len(ap_values) if ap_values else 0.0
+
+    # BWT: Backward Transfer = mean(R[K,j] - R[j,j]) for j < K
+    bwt_values = []
+    for j in range(K):
+        name = stage_names[j]
+        r_kj = last_row.get(name, 0.0)
+        r_jj = perf_matrix[j].get(name, 0.0)
+        bwt_values.append(r_kj - r_jj)
+    bwt = sum(bwt_values) / len(bwt_values) if bwt_values else 0.0
+
+    # Forgetting: mean(max_i(R[i,j]) - R[K,j]) for j < K
+    fgt_values = []
+    for j in range(K):
+        name = stage_names[j]
+        best_rij = max(perf_matrix[i].get(name, 0.0)
+                       for i in range(j, K + 1))
+        r_kj = last_row.get(name, 0.0)
+        fgt_values.append(best_rij - r_kj)
+    fgt = sum(fgt_values) / len(fgt_values) if fgt_values else 0.0
+
+    metrics = {
+        "average_performance": ap,
+        "backward_transfer": bwt,
+        "forgetting": fgt,
+    }
+    return metrics
+
+
+def print_performance_matrix(perf_matrix, stage_names):
+    """Pretty-print the performance matrix."""
+    Logger.print("")
+    Logger.print("=" * 60)
+    Logger.print(" PERFORMANCE MATRIX (mean_ep_len)")
+    Logger.print("=" * 60)
+
+    # Header
+    header = "{:<12s}".format("trained\\eval")
+    for name in stage_names:
+        header += " {:>10s}".format(name[:10])
+    Logger.print(header)
+
+    # Rows
+    for i, row in enumerate(perf_matrix):
+        line = "{:<12s}".format(stage_names[i][:12])
+        for j, name in enumerate(stage_names):
+            if name in row:
+                line += " {:>10.1f}".format(row[name])
+            else:
+                line += " {:>10s}".format("-")
+        Logger.print(line)
+
+    Logger.print("")
+
+
 def collect_obs_for_sgp(env, agent, n_steps=20):
     """Run trained policy and collect observations for SGP feature extraction.
 
@@ -326,6 +439,11 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
         record_video=first_stage_config["record_video"]
     )
 
+    # Performance matrix: perf_matrix[i] = {task_name: mean_ep_len} after stage i
+    perf_matrix = []
+    stage_names = [s.get("name", "stage_{}".format(i))
+                   for i, s in enumerate(stages[:end_stage + 1])]
+
     # Train each motion stage sequentially
     for stage_idx in range(start_stage, end_stage + 1):
         stage = stages[stage_idx]
@@ -351,15 +469,39 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
         in_model_file = out_model_file
         stage_records.append(stage_record)
 
-    # Final evaluation
-    skip_eval = args.parse_bool("skip_eval", False)
-    eval_results = None
-    if not skip_eval:
-        eval_results = evaluate_all_motions(
-            env, stages[:end_stage + 1], in_model_file,
+        # Evaluate all learned tasks after this stage
+        row = evaluate_after_stage(
+            env, stages, stage_idx, out_model_file,
             device, curriculum, args
         )
-        save_evaluation_results(curriculum_out_dir, eval_results)
+        perf_matrix.append(row)
+
+        # Restore motion for next stage training
+        if stage_idx < end_stage:
+            next_motion = stages[stage_idx + 1].get("env_overrides", {}).get("motion_file", "")
+            if next_motion:
+                env._load_motions(next_motion)
+
+    # Print full performance matrix and CL metrics
+    print_performance_matrix(perf_matrix, stage_names)
+    cl_metrics = compute_cl_metrics(perf_matrix, stage_names)
+    if cl_metrics:
+        Logger.print("CL Metrics:")
+        Logger.print("  Average Performance (AP): {:.1f}".format(cl_metrics["average_performance"]))
+        Logger.print("  Backward Transfer  (BWT): {:.1f}".format(cl_metrics["backward_transfer"]))
+        Logger.print("  Forgetting         (FGT): {:.1f}".format(cl_metrics["forgetting"]))
+
+    # Save performance matrix and metrics
+    if mp_util.is_root_proc():
+        matrix_data = {
+            "performance_matrix": perf_matrix,
+            "stage_names": stage_names,
+            "cl_metrics": cl_metrics,
+        }
+        matrix_path = os.path.join(curriculum_out_dir, "cl_metrics.yaml")
+        with open(matrix_path, "w") as f:
+            yaml.safe_dump(matrix_data, f, sort_keys=False)
+        Logger.print("CL metrics saved to {}".format(matrix_path))
 
     # Finalize
     cl_base.finalize_curriculum_outputs(curriculum_out_dir, stage_records,
