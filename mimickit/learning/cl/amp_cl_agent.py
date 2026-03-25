@@ -351,6 +351,19 @@ class AMPCLAgent(amp_agent.AMPAgent):
     # SGP: Gradient projection onto orthogonal complement of protected subspace
     # ------------------------------------------------------------------
 
+    def _get_sgp_protected_params(self):
+        """Yield all (name, param) pairs that SGP should protect.
+
+        Includes both _actor_layers and _action_dist output head.
+        """
+        for name, param in self._model._actor_layers.named_parameters():
+            if "weight" in name and param.dim() > 1:
+                yield ("actor." + name, param)
+
+        for name, param in self._model._action_dist.named_parameters():
+            if "weight" in name and param.dim() > 1:
+                yield ("output." + name, param)
+
     def _apply_sgp_projection(self):
         """Project actor gradients away from protected task subspaces."""
         if len(self._sgp_feature_mats) == 0:
@@ -359,32 +372,31 @@ class AMPCLAgent(amp_agent.AMPAgent):
         kk = 0
         self._sgp_call_count = getattr(self, '_sgp_call_count', 0) + 1
 
-        for name, param in self._model._actor_layers.named_parameters():
-            if "weight" in name and param.dim() > 1:
-                if kk >= len(self._sgp_feature_mats):
-                    break
+        for name, param in self._get_sgp_protected_params():
+            if kk >= len(self._sgp_feature_mats):
+                break
 
-                P = self._sgp_feature_mats[kk]
-                if P is not None and param.grad is not None:
-                    if P.device != param.device:
-                        P = P.to(param.device)
-                        self._sgp_feature_mats[kk] = P
+            P = self._sgp_feature_mats[kk]
+            if P is not None and param.grad is not None:
+                if P.device != param.device:
+                    P = P.to(param.device)
+                    self._sgp_feature_mats[kk] = P
 
-                    sz = param.grad.data.size(0)
-                    flat_grad = param.grad.data.view(sz, -1)
+                sz = param.grad.data.size(0)
+                flat_grad = param.grad.data.view(sz, -1)
 
-                    grad_norm_before = flat_grad.norm().item()
-                    proj = torch.mm(flat_grad, P)
-                    proj_norm = proj.norm().item()
-                    param.grad.data = param.grad.data - proj.view(param.grad.shape)
-                    grad_norm_after = param.grad.data.norm().item()
+                grad_norm_before = flat_grad.norm().item()
+                proj = torch.mm(flat_grad, P)
+                proj_norm = proj.norm().item()
+                param.grad.data = param.grad.data - proj.view(param.grad.shape)
+                grad_norm_after = param.grad.data.norm().item()
 
-                    # Log every 100 calls
-                    if self._sgp_call_count % 100 == 1:
-                        print("[SGP proj] layer={} P_shape={} grad_before={:.4f} projected={:.4f} grad_after={:.4f}".format(
-                            name, list(P.shape), grad_norm_before, proj_norm, grad_norm_after))
+                # Log every 100 calls
+                if self._sgp_call_count % 100 == 1:
+                    print("[SGP proj] layer={} P_shape={} grad_before={:.4f} projected={:.4f} grad_after={:.4f}".format(
+                        name, list(P.shape), grad_norm_before, proj_norm, grad_norm_after))
 
-                kk += 1
+            kk += 1
 
     # ------------------------------------------------------------------
     # CBP: Trigger neuron reinitialization

@@ -48,16 +48,18 @@ class SGPMemoryBank:
 
         return torch.cat(obs_list, dim=0)
 
-    def extract_features(self, actor_layers, obs_data):
+    def extract_features(self, actor_layers, obs_data, output_layer=None):
         """Extract SVD-based feature subspaces from actor layer activations.
 
-        Hooks into each nn.Linear layer in actor_layers, forwards obs_data,
-        and computes SVD on the input activations to get basis vectors.
+        Hooks into each nn.Linear layer in actor_layers (and optionally the
+        output layer), forwards obs_data, and computes SVD on the input
+        activations to get basis vectors.
 
         Args:
             actor_layers: nn.Sequential actor network.
             obs_data: Tensor [N, input_dim] of collected observations
                       (should include motion one-hot already concatenated).
+            output_layer: Optional output module (e.g. _action_dist) to also protect.
 
         Returns:
             list[Tensor]: Per-layer U basis matrices.
@@ -66,11 +68,11 @@ class SGPMemoryBank:
         activations = {}
         hooks = []
 
-        # Find all Linear layers and register hooks to capture their inputs
+        # Find all Linear layers in hidden network and register hooks
         linear_names = []
         for name, module in actor_layers.named_modules():
             if isinstance(module, nn.Linear):
-                linear_names.append(name)
+                linear_names.append("actor." + name)
 
                 def get_hook(layer_name):
                     def hook(mod, inp, out):
@@ -79,15 +81,35 @@ class SGPMemoryBank:
                         activations[layer_name].append(inp[0].detach())
                     return hook
 
-                h = module.register_forward_hook(get_hook(name))
+                h = module.register_forward_hook(get_hook("actor." + name))
                 hooks.append(h)
 
-        # Forward in batches
+        # Also hook the output layer if provided
+        if output_layer is not None:
+            output_layer.eval()
+            for name, module in output_layer.named_modules():
+                if isinstance(module, nn.Linear):
+                    full_name = "output." + name
+                    linear_names.append(full_name)
+
+                    def get_hook(layer_name):
+                        def hook(mod, inp, out):
+                            if layer_name not in activations:
+                                activations[layer_name] = []
+                            activations[layer_name].append(inp[0].detach())
+                        return hook
+
+                    h = module.register_forward_hook(get_hook(full_name))
+                    hooks.append(h)
+
+        # Forward in batches through full actor path
         batch_size = 1024
         with torch.no_grad():
             for i in range(0, len(obs_data), batch_size):
                 batch = obs_data[i:i + batch_size].to(next(actor_layers.parameters()).device)
-                actor_layers(batch)
+                h = actor_layers(batch)
+                if output_layer is not None:
+                    output_layer(h)
 
         # Remove hooks
         for h in hooks:
@@ -161,7 +183,7 @@ class SGPMemoryBank:
 
         return projection_matrices
 
-    def build_anchor_weights(self, actor_layers, projection_matrices):
+    def build_anchor_weights(self, actor_layers, projection_matrices, output_layer=None):
         """Compute anchor weights for each Linear layer.
 
         Anchor = W @ P, representing the current weight's projection onto
@@ -170,23 +192,34 @@ class SGPMemoryBank:
         Args:
             actor_layers: nn.Sequential actor network.
             projection_matrices: list of P matrices from build_projection_matrices().
+            output_layer: Optional output module (e.g. _action_dist) to also anchor.
 
         Returns:
             list[Tensor or None]: Per-layer anchor projections.
         """
         anchors = []
         kk = 0
+
+        # Collect all Linear modules in protected order
+        linear_modules = []
         for module in actor_layers.modules():
             if isinstance(module, nn.Linear):
-                if kk < len(projection_matrices) and projection_matrices[kk] is not None:
-                    P = projection_matrices[kk].to(module.weight.device)
-                    sz = module.weight.data.size(0)
-                    flat_w = module.weight.data.view(sz, -1)
-                    anchor = torch.mm(flat_w, P)
-                    anchors.append(anchor)
-                else:
-                    anchors.append(None)
-                kk += 1
+                linear_modules.append(module)
+        if output_layer is not None:
+            for module in output_layer.modules():
+                if isinstance(module, nn.Linear):
+                    linear_modules.append(module)
+
+        for module in linear_modules:
+            if kk < len(projection_matrices) and projection_matrices[kk] is not None:
+                P = projection_matrices[kk].to(module.weight.device)
+                sz = module.weight.data.size(0)
+                flat_w = module.weight.data.view(sz, -1)
+                anchor = torch.mm(flat_w, P)
+                anchors.append(anchor)
+            else:
+                anchors.append(None)
+            kk += 1
         return anchors
 
     def save(self, path):

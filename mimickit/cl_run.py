@@ -178,7 +178,8 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, sgp_mem,
             len(sgp_mem.memory_bank)))
         feature_mats = sgp_mem.build_projection_matrices()
         anchors = sgp_mem.build_anchor_weights(
-            agent._model._actor_layers, feature_mats
+            agent._model._actor_layers, feature_mats,
+            output_layer=agent._model._action_dist
         )
         agent.prepare_for_new_task(task_id, feature_mats, anchors)
     elif task_id == 0:
@@ -199,7 +200,10 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, sgp_mem,
     # E. Extract SGP features for memory bank
     Logger.print("Extracting SGP features for task {} ({})...".format(task_id, stage_name))
     obs_data = collect_obs_for_sgp(env, agent, n_steps=20)
-    new_features = sgp_mem.extract_features(agent._model._actor_layers, obs_data)
+    new_features = sgp_mem.extract_features(
+        agent._model._actor_layers, obs_data,
+        output_layer=agent._model._action_dist
+    )
     sgp_mem.memory_bank.append(new_features)
     Logger.print("Memory bank updated. Total tasks remembered: {}".format(
         len(sgp_mem.memory_bank)))
