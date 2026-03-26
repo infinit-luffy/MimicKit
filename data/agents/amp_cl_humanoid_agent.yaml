@@ -20,7 +20,7 @@ model:
   disc_net: "fc_2layers_1024units"
 
 actor_optimizer:
-    type: "Adam"
+    type: "SGD"
     learning_rate: 1e-4
 
 critic_optimizer:

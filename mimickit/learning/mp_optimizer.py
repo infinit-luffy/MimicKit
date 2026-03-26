@@ -82,7 +82,7 @@ class MPOptimizer():
         optimizer_type = config["type"]
 
         if (optimizer_type == "SGD"):
-            optimizer = torch.optim.SGD(param_list, lr, momentum=0.9, weight_decay=weight_decay)
+            optimizer = torch.optim.SGD(param_list, lr, momentum=0.0, weight_decay=weight_decay)
         elif (optimizer_type == "Adam"):
             optimizer = torch.optim.AdamW(param_list, lr, weight_decay=weight_decay)
         else:
