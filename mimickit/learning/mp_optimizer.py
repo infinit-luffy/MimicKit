@@ -83,7 +83,7 @@ class MPOptimizer():
 
         if (optimizer_type == "SGD"):
             optimizer = torch.optim.SGD(param_list, lr, momentum=0.0, weight_decay=weight_decay)
-        elif (optimizer_type == "Adam"):
+        elif (optimizer_type == "Adam" or optimizer_type == "SGP_Adam"):
             optimizer = torch.optim.AdamW(param_list, lr, weight_decay=weight_decay)
         else:
             assert(False), "Unsupported optimizer type: " + optimizer_type
@@ -120,4 +120,154 @@ class MPOptimizer():
     
     def _clip_grads(self, max_norm):
         torch.nn.utils.clip_grad_norm_(self._param_list, max_norm)
+        return
+
+
+class SGPAdamOptimizer():
+    """Adam optimizer with double gradient projection for SGP-compatible CL.
+
+    For protected parameters, projects gradients both before and after Adam's
+    momentum/variance update. The second projection corrects direction drift
+    caused by Adam's per-element adaptive scaling (m / sqrt(v)), which would
+    otherwise rotate the update back into the protected subspace.
+
+    When no feature matrices are set (task 0), behaves as standard Adam.
+    """
+    CHECK_SYNC_STEPS = 1000
+
+    def __init__(self, config, param_list):
+        self._param_list = param_list
+        self._lr = float(config["learning_rate"])
+        self._beta1 = float(config.get("beta1", 0.9))
+        self._beta2 = float(config.get("beta2", 0.999))
+        self._eps = float(config.get("eps", 1e-8))
+        self._max_grad_norm = float(config.get("sgp_max_grad_norm", 50.0))
+        self._steps = 0
+        self._log_interval = 100
+
+        # Per-parameter Adam state
+        self._m = [torch.zeros_like(p) for p in param_list]
+        self._v = [torch.zeros_like(p) for p in param_list]
+        self._t = [1 for _ in param_list]
+
+        # SGP projection matrices (set when new task starts)
+        self._feature_mats = []
+
+        if (mp_util.enable_mp()):
+            self._param_buffer = self._build_param_buffer()
+
+        self.sync()
+        return
+
+    def set_feature_matrices(self, feature_mats):
+        self._feature_mats = feature_mats if feature_mats else []
+
+    def step(self, loss):
+        # Zero gradients
+        for p in self._param_list:
+            if p.grad is not None:
+                p.grad.zero_()
+
+        loss.backward()
+
+        if (mp_util.enable_mp()):
+            self._aggregate_mp_grads()
+
+        do_log = (self._steps % self._log_interval == 0)
+
+        for k, param in enumerate(self._param_list):
+            if param.grad is None:
+                self._t[k] += 1
+                continue
+
+            sz = param.grad.data.size(0)
+
+            # Check if this param has a projection matrix
+            P = None
+            if (k < len(self._feature_mats)
+                    and self._feature_mats[k] is not None
+                    and param.dim() > 1):
+                P = self._feature_mats[k]
+                if P.device != param.device:
+                    P = P.to(param.device)
+                    self._feature_mats[k] = P
+
+            # 1st projection: project gradient before Adam update
+            if P is not None:
+                flat_grad = param.grad.data.view(sz, -1)
+                proj = torch.mm(flat_grad, P)
+                param.grad.data = param.grad.data - proj.view(param.grad.shape)
+
+            # Adam momentum / variance update
+            self._m[k] = self._beta1 * self._m[k] + (1 - self._beta1) * param.grad.data
+            self._v[k] = self._beta2 * self._v[k] + (1 - self._beta2) * param.grad.data ** 2
+
+            m_hat = self._m[k] / (1 - self._beta1 ** self._t[k])
+            v_hat = self._v[k] / (1 - self._beta2 ** self._t[k])
+            grad_mod = m_hat / (torch.sqrt(v_hat) + self._eps)
+
+            # 2nd projection: correct Adam's adaptive-scaling drift
+            if P is not None:
+                grad_before = grad_mod.norm().item()
+
+                flat_mod = grad_mod.view(sz, -1)
+                proj2 = torch.mm(flat_mod, P)
+                grad_mod = grad_mod - proj2.view(param.size())
+
+                # Per-layer gradient clipping
+                mod_norm = grad_mod.norm().item()
+                if mod_norm > self._max_grad_norm:
+                    grad_mod.mul_(self._max_grad_norm / (mod_norm + 1e-8))
+
+                if do_log:
+                    leak = proj2.norm().item()
+                    print("[SGP_Adam] layer={} adam_norm={:.4f} leak={:.4f} final={:.4f}".format(
+                        k, grad_before, leak, mod_norm))
+
+            param.data = param.data - self._lr * grad_mod
+            self._t[k] += 1
+
+        if (mp_util.enable_mp() and (self._steps % self.CHECK_SYNC_STEPS == 0)):
+            assert(self._check_synced()), "Network parameters desynchronized"
+
+        self._steps += 1
+        return
+
+    def step_with_grad_hook(self, loss, pre_step_fn=None):
+        """Interface-compatible with MPOptimizer. Ignores pre_step_fn."""
+        self.step(loss)
+
+    def get_steps(self):
+        return self._steps
+
+    def sync(self):
+        with torch.no_grad():
+            for param in self._param_list:
+                global_param = mp_util.broadcast(param)
+                param.copy_(global_param)
+        return
+
+    def _build_param_buffer(self):
+        buffer = torch.nn.utils.parameters_to_vector(self._param_list).clone().detach()
+        return buffer
+
+    def _check_synced(self):
+        synced = True
+        for param in self._param_list:
+            global_param = mp_util.broadcast(param)
+            param_synced = torch.equal(param, global_param)
+            if (not param_synced):
+                synced = False
+
+        device = self._param_list[0].device
+        buffer = torch.tensor([synced], dtype=torch.int, device=device)
+        mp_util.reduce_min(buffer)
+        synced = buffer.item() != 0
+        return synced
+
+    def _aggregate_mp_grads(self):
+        grad_list = [p.grad for p in self._param_list]
+        self._param_buffer[:] = torch.nn.utils.parameters_to_vector(grad_list)
+        mp_util.reduce_inplace_mean(self._param_buffer)
+        torch.nn.utils.vector_to_parameters(self._param_buffer, grad_list)
         return

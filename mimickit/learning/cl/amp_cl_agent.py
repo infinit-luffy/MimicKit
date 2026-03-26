@@ -509,6 +509,10 @@ class AMPCLAgent(amp_agent.AMPAgent):
         self._sgp_anchors = sgp_anchors
         self._sgp_call_count = 0
 
+        # Pass feature matrices to SGP_Adam optimizer if applicable
+        if isinstance(self._actor_optimizer, mp_optimizer.SGPAdamOptimizer):
+            self._actor_optimizer.set_feature_matrices(sgp_feature_mats)
+
         num_valid = sum(1 for p in sgp_feature_mats if p is not None)
         Logger.print("SGP: {} projection matrices loaded ({} valid)".format(
             len(sgp_feature_mats), num_valid))
@@ -548,7 +552,11 @@ class AMPCLAgent(amp_agent.AMPAgent):
         # Rebuild actor optimizer without frozen params
         actor_config = self._config["actor_optimizer"]
         actor_params = [p for p in self._model.get_actor_params() if p.requires_grad]
-        self._actor_optimizer = mp_optimizer.MPOptimizer(actor_config, actor_params)
+        if actor_config["type"] == "SGP_Adam":
+            self._actor_optimizer = mp_optimizer.SGPAdamOptimizer(actor_config, actor_params)
+            Logger.print("Using SGP_Adam optimizer (double projection)")
+        else:
+            self._actor_optimizer = mp_optimizer.MPOptimizer(actor_config, actor_params)
         return
 
     def _reset_discriminator(self):
