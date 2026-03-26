@@ -127,6 +127,21 @@ class AMPCLAgent(amp_agent.AMPAgent):
         return
 
     # ------------------------------------------------------------------
+    # Normalizer: freeze obs_norm after first task
+    # ------------------------------------------------------------------
+
+    def _need_normalizer_update(self):
+        """Stop updating obs normalizer after task 0.
+
+        The obs normalizer's running mean/std would drift with each new task's
+        observation distribution, corrupting the input to the actor for old tasks.
+        SGP protects weights but cannot protect the normalization statistics.
+        """
+        if self._current_task_id > 0:
+            return False
+        return super()._need_normalizer_update()
+
+    # ------------------------------------------------------------------
     # Motion management
     # ------------------------------------------------------------------
 
@@ -537,7 +552,7 @@ class AMPCLAgent(amp_agent.AMPAgent):
         return
 
     def _reset_discriminator(self):
-        """Reset discriminator weights and replay buffer for a new motion."""
+        """Reset discriminator weights, normalizer and replay buffer for a new motion."""
         Logger.print("Resetting discriminator for new task...")
 
         # Reset model weights
@@ -545,6 +560,14 @@ class AMPCLAgent(amp_agent.AMPAgent):
 
         # Clear replay buffer
         self._disc_buffer.clear()
+
+        # Reset disc obs normalizer (new motion has different observation distribution)
+        disc_obs_space = self._env.get_disc_obs_space()
+        disc_obs_dtype = torch.float32
+        import learning.normalizer as normalizer
+        self._disc_obs_norm = normalizer.Normalizer(
+            disc_obs_space.shape, clip=10.0, device=self._device, dtype=disc_obs_dtype
+        )
 
         # Rebuild disc optimizer with fresh state
         disc_config = self._config["disc_optimizer"]
