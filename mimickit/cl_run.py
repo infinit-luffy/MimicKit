@@ -1,18 +1,18 @@
 """
 Continual Learning Training Script for MimicKit.
 
-Orchestrates sequential motion learning with CBP + SGP protection.
-Extends the continual_run.py patterns with SGP memory extraction/injection
-between stages.
+Orchestrates sequential motion learning with gradient projection (GPM/SGP)
+or EWC protection between stages.
 
 Usage:
     python cl_run.py --curriculum_config data/curriculums/cl_humanoid_example.yaml
 
 Each stage in the curriculum trains one motion. Between stages:
-- SGP features are extracted via SVD on actor activations
-- Projection matrices protect previous motion subspaces
-- Discriminator is reset for the new motion
-- CBP utility tracking is reset
+- GPM/SGP: features are extracted via SVD on actor activations, projection
+  matrices protect previous motion subspaces.
+- EWC: Fisher Information is computed, quadratic penalty protects parameters.
+- Discriminator is reset for the new motion.
+- CBP utility tracking is reset.
 """
 
 import copy
@@ -28,7 +28,8 @@ rsl_rl_util.configure_rsl_rl_path()
 
 import envs.env_builder as env_builder
 import learning.agent_builder as agent_builder
-import learning.cl.sgp_memory as sgp_memory
+import learning.cl.projection_memory as projection_memory
+import learning.cl.ewc_memory as ewc_memory
 import continual_run as cl_base
 import run as run_lib
 from util.logger import Logger
@@ -53,11 +54,36 @@ def resolve_rand_seed(args):
         return int(np.uint64(time.time() * 256))
 
 
-def save_training_config(out_dir, curriculum, curriculum_file, args, rand_seed):
+def collect_cli_overrides(args):
+    overrides = {}
+
+    int_args = ["rand_seed", "start_stage", "end_stage", "num_envs", "max_samples"]
+    for key in int_args:
+        if args.has_key(key):
+            overrides[key] = args.parse_int(key)
+
+    string_args = [
+        "curriculum_config", "env_config", "agent_config", "engine_config",
+        "out_dir", "logger", "model_file", "cl_memory_file", "sgp_memory_file",
+        "cl_method", "algorithm", "algo", "optimizer", "optim",
+        "actor_optimizer", "actor_optim",
+        "critic_optimizer", "critic_optim",
+        "disc_optimizer", "disc_optim",
+    ]
+    for key in string_args:
+        if args.has_key(key):
+            overrides[key] = args.parse_string(key)
+
+    return overrides
+
+
+def save_training_config(out_dir, curriculum, curriculum_file, args, rand_seed,
+                         first_stage_config):
     """Save full training configuration to the output directory."""
     if not mp_util.is_root_proc():
         return
 
+    agent_config = first_stage_config["agent_config"]
     config = {
         "curriculum_file": curriculum_file,
         "rand_seed": int(rand_seed),
@@ -68,12 +94,19 @@ def save_training_config(out_dir, curriculum, curriculum_file, args, rand_seed):
         "num_stages": len(curriculum["stages"]),
         "stage_names": [s.get("name", "stage_{}".format(i))
                         for i, s in enumerate(curriculum["stages"])],
-        "env_config": curriculum.get("env_config", ""),
-        "agent_config": curriculum.get("agent_config", ""),
-        "engine_config": curriculum.get("engine_config", ""),
-        "max_samples_per_stage": curriculum.get("max_samples", "default"),
-        "num_envs": curriculum.get("num_envs", "default"),
-        "logger": curriculum.get("logger", "tb"),
+        "env_config": args.parse_string("env_config", curriculum.get("env_config", "")),
+        "agent_config": args.parse_string("agent_config", curriculum.get("agent_config", "")),
+        "engine_config": args.parse_string("engine_config", curriculum.get("engine_config", "")),
+        "max_samples_per_stage": args.parse_int(
+            "max_samples", curriculum.get("max_samples", "default")
+        ),
+        "num_envs": args.parse_int("num_envs", curriculum.get("num_envs", "default")),
+        "logger": args.parse_string("logger", curriculum.get("logger", "tb")),
+        "cl_method": agent_config.get("cl_method", "gpm"),
+        "actor_optimizer": agent_config.get("actor_optimizer", {}).get("type", "default"),
+        "critic_optimizer": agent_config.get("critic_optimizer", {}).get("type", "default"),
+        "disc_optimizer": agent_config.get("disc_optimizer", {}).get("type", "default"),
+        "command_line_overrides": collect_cli_overrides(args),
     }
 
     config_path = os.path.join(out_dir, "training_config.yaml")
@@ -214,8 +247,8 @@ def print_performance_matrix(perf_matrix, stage_names):
     Logger.print("")
 
 
-def collect_obs_for_sgp(env, agent, n_steps=20):
-    """Run trained policy and collect observations for SGP feature extraction.
+def collect_obs_for_projection(env, agent, n_steps=20):
+    """Run trained policy and collect observations for feature extraction.
 
     Returns observations concatenated with motion one-hot, matching actor input.
     """
@@ -245,8 +278,8 @@ def evaluate_motion(agent, env, motion_id, num_episodes=10):
     return result
 
 
-def train_cl_stage(env, stage_config, task_id, device, in_model_file, sgp_mem,
-                   curriculum_file):
+def train_cl_stage(env, stage_config, task_id, device, in_model_file, cl_mem,
+                   curriculum_file, cl_method="gpm"):
     """Train one CL stage (one motion), reusing the existing env.
 
     Args:
@@ -255,8 +288,9 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, sgp_mem,
         task_id: Integer task ID for this motion.
         device: Torch device.
         in_model_file: Path to previous stage's model checkpoint.
-        sgp_mem: SGPMemoryBank instance.
+        cl_mem: ProjectionMemoryBank or EWCMemory instance.
         curriculum_file: Path to curriculum config file.
+        cl_method: "gpm", "sgp", or "ewc".
 
     Returns:
         (out_model_file, stage_record)
@@ -264,8 +298,8 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, sgp_mem,
     stage_name = stage_config["name"]
     Logger.print("")
     Logger.print("=" * 60)
-    Logger.print(" CL STAGE {}: {} (task_id={})".format(
-        stage_config["index"], stage_name, task_id))
+    Logger.print(" CL STAGE {}: {} (task_id={}, method={})".format(
+        stage_config["index"], stage_name, task_id, cl_method))
     Logger.print("=" * 60)
 
     cl_base.save_stage_files(stage_config, curriculum_file=curriculum_file,
@@ -286,15 +320,20 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, sgp_mem,
         Logger.print("Loading previous model from {}".format(in_model_file))
         agent.load(in_model_file)
 
-        # Build and inject SGP projection matrices
-        Logger.print("Building SGP projection matrices from {} tasks...".format(
-            len(sgp_mem.memory_bank)))
-        feature_mats = sgp_mem.build_projection_matrices()
-        anchors = sgp_mem.build_anchor_weights(
-            agent._model._actor_layers, feature_mats,
-            output_layer=agent._model._action_dist
-        )
-        agent.prepare_for_new_task(task_id, feature_mats, anchors)
+        if cl_method in ("gpm", "sgp"):
+            # Build and inject projection matrices
+            Logger.print("Building {} projection matrices from {} tasks...".format(
+                cl_method.upper(), cl_mem.num_tasks))
+            proj_data = cl_mem.build_projection_matrices()
+            anchors = cl_mem.build_anchor_weights(
+                agent._model._actor_layers, proj_data,
+                output_layer=agent._model._action_dist
+            )
+            agent.prepare_for_new_task(task_id, projection_data=proj_data,
+                                        projection_anchors=anchors)
+        elif cl_method == "ewc":
+            agent.prepare_for_new_task(task_id, ewc_memory=cl_mem)
+
     elif task_id == 0:
         # First task: optionally load a pretrained base model
         model_file = stage_config.get("model_file", "")
@@ -310,22 +349,27 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, sgp_mem,
         logger_type=stage_config["logger_type"]
     )
 
-    # E. Extract SGP features for memory bank
-    Logger.print("Extracting SGP features for task {} ({})...".format(task_id, stage_name))
-    obs_data = collect_obs_for_sgp(env, agent, n_steps=20)
-    new_features = sgp_mem.extract_features(
-        agent._model._actor_layers, obs_data,
-        output_layer=agent._model._action_dist
-    )
-    sgp_mem.memory_bank.append(new_features)
-    Logger.print("Memory bank updated. Total tasks remembered: {}".format(
-        len(sgp_mem.memory_bank)))
+    # E. Extract features / compute Fisher for memory
+    if cl_method in ("gpm", "sgp"):
+        Logger.print("Updating {} memory for task {} ({})...".format(
+            cl_method.upper(), task_id, stage_name))
+        obs_data = collect_obs_for_projection(env, agent, n_steps=20)
+        cl_mem.update_memory(
+            agent._model._actor_layers, obs_data, task_id,
+            output_layer=agent._model._action_dist
+        )
+        Logger.print("Projection memory updated. Total tasks: {}".format(
+            cl_mem.num_tasks))
+    elif cl_method == "ewc":
+        Logger.print("Computing Fisher for task {} ({})...".format(task_id, stage_name))
+        fisher = cl_mem.compute_fisher(agent, env, n_steps=20)
+        cl_mem.register_task(agent, fisher)
 
     # F. Save model and memory
     out_model_file = os.path.join(stage_config["out_dir"], "model.pt")
-    sgp_memory_file = os.path.join(stage_config["out_dir"], "sgp_memory.pt")
+    cl_memory_file = os.path.join(stage_config["out_dir"], "cl_memory.pt")
     agent.save(out_model_file)
-    sgp_mem.save(sgp_memory_file)
+    cl_mem.save(cl_memory_file)
 
     stage_record = {
         "index": stage_config["index"],
@@ -333,7 +377,7 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, sgp_mem,
         "task_id": task_id,
         "out_dir": stage_config["out_dir"],
         "model_file": out_model_file,
-        "sgp_memory_file": sgp_memory_file,
+        "cl_memory_file": cl_memory_file,
         "init_model_file": in_model_file,
         "max_samples": int(stage_config["max_samples"])
     }
@@ -391,12 +435,13 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
     assert 0 <= start_stage < len(stages)
     assert start_stage <= end_stage < len(stages)
 
+    first_stage = stages[start_stage]
+    first_stage_config = cl_base.build_stage_config(
+        start_stage, first_stage, curriculum, args
+    )
+
     # Build output dir: base/YYYY-MM-DD_seedXXX_agentname/
-    agent_file = curriculum.get("agent_config", args.parse_string("agent_config", ""))
-    agent_name = "AMP_CL"
-    if agent_file != "":
-        agent_cfg = cl_base.load_yaml(agent_file)
-        agent_name = agent_cfg.get("agent_name", "AMP_CL")
+    agent_name = first_stage_config["agent_config"].get("agent_name", "AMP_CL")
 
     base_out_dir = curriculum.get("out_dir",
                                    args.parse_string("out_dir", "output/"))
@@ -409,26 +454,53 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
 
     # Save full training config
     save_training_config(curriculum_out_dir, curriculum,
-                         curriculum_config_file, args, rand_seed)
+                         curriculum_config_file, args, rand_seed,
+                         first_stage_config)
 
     in_model_file = args.parse_string("model_file",
                                        curriculum.get("model_file", ""))
     prev_signature = None
     stage_records = []
 
-    # Load existing SGP memory if resuming
-    sgp_mem = sgp_memory.SGPMemoryBank(device=device)
-    sgp_memory_file = args.parse_string("sgp_memory_file", "")
-    if sgp_memory_file != "":
-        sgp_mem.load(sgp_memory_file)
-        Logger.print("Loaded SGP memory from {} ({} tasks)".format(
-            sgp_memory_file, len(sgp_mem.memory_bank)))
+    # Determine CL method from the effective agent config after CLI overrides.
+    agent_cfg = first_stage_config["agent_config"]
+    cl_method = agent_cfg.get("cl_method", "gpm")
+
+    # Create CL memory
+    if cl_method in ("gpm", "sgp"):
+        threshold = agent_cfg.get("projection_threshold",
+                                   agent_cfg.get("sgp_threshold", 0.98))
+        cl_mem = projection_memory.ProjectionMemoryBank(
+            device=device, threshold=threshold, method=cl_method
+        )
+    elif cl_method == "ewc":
+        ewc_lambda = agent_cfg.get("ewc_lambda", 1000.0)
+        ewc_online = agent_cfg.get("ewc_online", False)
+        ewc_gamma = agent_cfg.get("ewc_gamma", 0.95)
+        cl_mem = ewc_memory.EWCMemory(
+            device=device, ewc_lambda=ewc_lambda,
+            online=ewc_online, gamma=ewc_gamma
+        )
+    else:
+        assert False, "Unknown cl_method: {}".format(cl_method)
+
+    Logger.print("CL method: {}".format(cl_method.upper()))
+
+    # Load existing CL memory if resuming
+    cl_memory_file = args.parse_string("cl_memory_file",
+                                        args.parse_string("sgp_memory_file", ""))
+    if cl_memory_file != "":
+        cl_mem.load(cl_memory_file)
+        if cl_method in ("gpm", "sgp"):
+            Logger.print("Loaded CL memory from {} ({} tasks)".format(
+                cl_memory_file, cl_mem.num_tasks))
+        else:
+            Logger.print("Loaded EWC memory from {} ({} tasks)".format(
+                cl_memory_file, len(cl_mem.tasks)))
 
     # Build env ONCE using the first stage's config (IsaacGym PhysX Foundation
     # is a singleton — cannot be destroyed and recreated within a process).
     # Between stages, only the motion file is swapped via env._load_motions().
-    first_stage = stages[start_stage]
-    first_stage_config = cl_base.build_stage_config(start_stage, first_stage, curriculum, args)
     Logger.print("Building environment (shared across all stages)...")
     env = env_builder.build_env_from_config(
         env_config=first_stage_config["env_config"],
@@ -449,6 +521,11 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
         stage = stages[stage_idx]
         stage_config = cl_base.build_stage_config(stage_idx, stage, curriculum, args)
         task_id = stage_idx  # task_id = stage index
+        stage_cl_method = stage_config["agent_config"].get("cl_method", cl_method)
+        assert stage_cl_method == cl_method, \
+            "Changing cl_method across stages is not supported: {} vs {}".format(
+                stage_cl_method, cl_method
+            )
 
         # Redirect stage output into the run directory
         stage_name = cl_base.sanitize_stage_name(stage_config["name"])
@@ -462,8 +539,9 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
             task_id=task_id,
             device=device,
             in_model_file=in_model_file,
-            sgp_mem=sgp_mem,
-            curriculum_file=curriculum_config_file
+            cl_mem=cl_mem,
+            curriculum_file=curriculum_config_file,
+            cl_method=cl_method
         )
 
         in_model_file = out_model_file
@@ -507,10 +585,10 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
     cl_base.finalize_curriculum_outputs(curriculum_out_dir, stage_records,
                                         in_model_file)
 
-    # Save final SGP memory
-    final_sgp_path = os.path.join(curriculum_out_dir, "sgp_memory_final.pt")
-    sgp_mem.save(final_sgp_path)
-    Logger.print("Final SGP memory saved to {}".format(final_sgp_path))
+    # Save final CL memory
+    final_memory_path = os.path.join(curriculum_out_dir, "cl_memory_final.pt")
+    cl_mem.save(final_memory_path)
+    Logger.print("Final CL memory saved to {}".format(final_memory_path))
     Logger.print("")
     Logger.print("All outputs saved to: {}".format(curriculum_out_dir))
 

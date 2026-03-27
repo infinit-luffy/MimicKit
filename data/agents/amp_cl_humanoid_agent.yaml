@@ -5,8 +5,16 @@ max_motions: 20
 enable_cbp: false
 cbp_replacement_rate: 1e-4
 cbp_maturity_threshold: 1000
-sgp_threshold: 0.98
-sgp_gpm_ratio_threshold: 0.02
+
+# CL method: "gpm", "sgp", or "ewc"
+cl_method: "gpm"
+projection_threshold: 0.98
+gpm_ratio_threshold: 0.02
+
+# EWC parameters (only used when cl_method: "ewc")
+ewc_lambda: 1000.0
+ewc_online: false
+ewc_gamma: 0.95
 
 model:
   actor_net: "fc_2layers_1024units"

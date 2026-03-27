@@ -55,6 +55,40 @@ def merge_dicts(base_dict, override_dict):
     return result
 
 
+def _parse_first_string_arg(args, keys, default=""):
+    for key in keys:
+        if args.has_key(key):
+            return args.parse_string(key)
+    return default
+
+
+def apply_agent_cli_overrides(agent_config, args):
+    agent_config = copy.deepcopy(agent_config)
+
+    cl_method = _parse_first_string_arg(args, ["cl_method", "algorithm", "algo"])
+    if (cl_method != ""):
+        agent_config["cl_method"] = cl_method
+
+    global_optimizer = _parse_first_string_arg(args, ["optimizer", "optim"])
+    optimizer_overrides = {
+        "actor_optimizer": _parse_first_string_arg(args, ["actor_optimizer", "actor_optim"]),
+        "critic_optimizer": _parse_first_string_arg(args, ["critic_optimizer", "critic_optim"]),
+        "disc_optimizer": _parse_first_string_arg(args, ["disc_optimizer", "disc_optim"]),
+        "enc_optimizer": _parse_first_string_arg(args, ["enc_optimizer", "enc_optim"]),
+    }
+
+    if (global_optimizer != ""):
+        for key in optimizer_overrides.keys():
+            if (key in agent_config and isinstance(agent_config[key], dict)):
+                agent_config[key]["type"] = global_optimizer
+
+    for key, optimizer_type in optimizer_overrides.items():
+        if (optimizer_type != "" and key in agent_config and isinstance(agent_config[key], dict)):
+            agent_config[key]["type"] = optimizer_type
+
+    return agent_config
+
+
 def sanitize_stage_name(stage_name):
     safe_name = re.sub(r"[^0-9a-zA-Z]+", "_", stage_name).strip("_")
     if (safe_name == ""):
@@ -103,6 +137,7 @@ def build_stage_config(stage_idx, stage, curriculum, args):
 
     env_config = merge_dicts(env_config, env_overrides)
     agent_config = merge_dicts(agent_config, agent_overrides)
+    agent_config = apply_agent_cli_overrides(agent_config, args)
 
     if (engine_overrides is not None and len(engine_overrides) > 0):
         engine_config = env_builder.override_engine_config(engine_overrides, engine_config)

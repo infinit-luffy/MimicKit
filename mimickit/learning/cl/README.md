@@ -18,6 +18,16 @@ python cl_run.py \
   --max_samples 1000000
 ```
 
+Override CL method and optimizer from the command line:
+```bash
+python cl_run.py \
+  --curriculum_config data/curriculums/cl_humanoid_example.yaml \
+  --cl_method sgp \
+  --actor_optimizer Projection_Adam \
+  --critic_optimizer Adam \
+  --disc_optimizer Adam
+```
+
 Resume from a specific stage:
 ```bash
 python cl_run.py \
@@ -147,6 +157,11 @@ All standard AMP parameters (actor/critic/disc networks, learning rates, PPO hyp
 | `--rand_seed` | Random seed (auto-generated from time if not set) |
 | `--num_envs` | Override num_envs from curriculum |
 | `--max_samples` | Override max_samples per stage |
+| `--cl_method` / `--algorithm` / `--algo` | Override CL algorithm (`gpm`, `sgp`, `ewc`) |
+| `--optimizer` | Override all optimizer types at once |
+| `--actor_optimizer` | Override actor optimizer type |
+| `--critic_optimizer` | Override critic optimizer type |
+| `--disc_optimizer` | Override discriminator optimizer type |
 | `--start_stage` | Resume from this stage index (0-based) |
 | `--end_stage` | Stop after this stage index |
 | `--model_file` | Initial model checkpoint (for stage 0 or resuming) |

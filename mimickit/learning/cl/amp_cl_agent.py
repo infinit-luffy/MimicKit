@@ -4,7 +4,8 @@ AMP Continual Learning Agent.
 Extends AMPAgent with:
 - Motion one-hot conditioning (actor/critic receive [obs, one-hot])
 - CBP (Continual Backpropagation) for selective neuron reinitialization
-- SGP (Subspace Gradient Projection) to protect learned motion subspaces
+- Gradient projection (GPM/SGP) to protect learned motion subspaces
+- EWC (Elastic Weight Consolidation) as alternative protection
 - Per-task discriminator reset
 
 Follows the same conditioning pattern as ASEAgent (ase_agent.py).
@@ -19,7 +20,7 @@ import learning.amp_agent as amp_agent
 import learning.base_agent as base_agent
 import learning.cl.amp_cl_model as amp_cl_model
 import learning.cl.cbp_linear as cbp_linear
-import learning.cl.sgp_memory as sgp_memory
+import learning.cl.projection_memory as projection_memory
 import learning.mp_optimizer as mp_optimizer
 import learning.rl_util as rl_util
 import util.mp_util as mp_util
@@ -43,8 +44,14 @@ class AMPCLAgent(amp_agent.AMPAgent):
         self._enable_cbp = config.get("enable_cbp", False)
         self._cbp_replacement_rate = config.get("cbp_replacement_rate", 1e-4)
         self._cbp_maturity_threshold = config.get("cbp_maturity_threshold", 1000)
-        self._sgp_threshold = config.get("sgp_threshold", 0.98)
-        self._sgp_gpm_ratio_threshold = config.get("sgp_gpm_ratio_threshold", 0.02)
+        self._projection_threshold = config.get("projection_threshold",
+                                                  config.get("sgp_threshold", 0.98))
+        self._gpm_ratio_threshold = config.get("gpm_ratio_threshold",
+                                                config.get("sgp_gpm_ratio_threshold", 0.02))
+        self._cl_method = config.get("cl_method", "gpm")
+        self._ewc_lambda = config.get("ewc_lambda", 1000.0)
+        self._ewc_online = config.get("ewc_online", False)
+        self._ewc_gamma = config.get("ewc_gamma", 0.95)
         return
 
     def _build_model(self, config):
@@ -121,9 +128,12 @@ class AMPCLAgent(amp_agent.AMPAgent):
         self._motion_ids_buf = torch.zeros(num_envs, device=self._device, dtype=torch.long)
         self._motion_onehot_buf = self._model.get_motion_onehot(self._motion_ids_buf)
 
-        # SGP state
-        self._sgp_feature_mats = []  # per-layer projection matrices
-        self._sgp_anchors = []       # per-layer anchor weight projections
+        # Projection state (used by GPM and SGP)
+        self._projection_data = []
+        self._projection_anchors = []
+
+        # EWC state (set externally when cl_method == "ewc")
+        self._ewc_memory = None
         return
 
     # ------------------------------------------------------------------
@@ -131,12 +141,7 @@ class AMPCLAgent(amp_agent.AMPAgent):
     # ------------------------------------------------------------------
 
     def _need_normalizer_update(self):
-        """Stop updating obs normalizer after task 0.
-
-        The obs normalizer's running mean/std would drift with each new task's
-        observation distribution, corrupting the input to the actor for old tasks.
-        SGP protects weights but cannot protect the normalization statistics.
-        """
+        """Stop updating obs normalizer after task 0."""
         if self._current_task_id > 0:
             return False
         return super()._need_normalizer_update()
@@ -262,7 +267,7 @@ class AMPCLAgent(amp_agent.AMPAgent):
         return info
 
     # ------------------------------------------------------------------
-    # Loss computation (override to pass one-hot)
+    # Loss computation (override to pass one-hot + EWC penalty)
     # ------------------------------------------------------------------
 
     def _compute_actor_loss(self, batch):
@@ -319,6 +324,12 @@ class AMPCLAgent(amp_agent.AMPAgent):
             actor_loss += self._action_reg_weight * action_reg_loss
             info["action_reg_loss"] = action_reg_loss.detach()
 
+        # EWC penalty
+        if self._cl_method == "ewc" and self._ewc_memory is not None:
+            ewc_loss = self._ewc_memory.compute_ewc_loss(self)
+            actor_loss += ewc_loss
+            info["ewc_loss"] = ewc_loss.detach()
+
         return info
 
     def _compute_critic_loss(self, batch):
@@ -337,7 +348,7 @@ class AMPCLAgent(amp_agent.AMPAgent):
         return info
 
     # ------------------------------------------------------------------
-    # Actor update with SGP gradient projection and CBP
+    # Actor update with gradient projection and CBP
     # ------------------------------------------------------------------
 
     def _update_actor(self, batch_size, num_steps):
@@ -348,9 +359,9 @@ class AMPCLAgent(amp_agent.AMPAgent):
             loss_info = self._compute_actor_loss(batch)
             loss = loss_info["actor_loss"]
 
-            # Use step_with_grad_hook to inject SGP projection
+            # Use step_with_grad_hook to inject gradient projection
             self._actor_optimizer.step_with_grad_hook(
-                loss, pre_step_fn=self._apply_sgp_projection
+                loss, pre_step_fn=self._apply_gradient_projection
             )
 
             # CBP reinit + anchor correction after optimizer step
@@ -363,11 +374,11 @@ class AMPCLAgent(amp_agent.AMPAgent):
         return info
 
     # ------------------------------------------------------------------
-    # SGP: Gradient projection onto orthogonal complement of protected subspace
+    # Gradient projection (GPM / SGP)
     # ------------------------------------------------------------------
 
-    def _get_sgp_protected_params(self):
-        """Yield all (name, param) pairs that SGP should protect.
+    def _get_protected_params(self):
+        """Yield all (name, param) pairs that gradient projection should protect.
 
         Includes both _actor_layers and _action_dist output head.
         """
@@ -379,37 +390,37 @@ class AMPCLAgent(amp_agent.AMPAgent):
             if "weight" in name and param.dim() > 1:
                 yield ("output." + name, param)
 
-    def _apply_sgp_projection(self):
-        """Project actor gradients away from protected task subspaces."""
-        if len(self._sgp_feature_mats) == 0:
+    def _apply_gradient_projection(self):
+        """Project actor gradients away from protected task subspaces.
+
+        For GPM: hard projection via P = U @ U^T.
+        For SGP: scaled projection via U @ diag(alpha) @ U^T.
+        For EWC: no-op (EWC uses loss penalty instead).
+        """
+        if self._cl_method == "ewc" or len(self._projection_data) == 0:
             return
 
         kk = 0
-        self._sgp_call_count = getattr(self, '_sgp_call_count', 0) + 1
+        self._projection_call_count = getattr(self, '_projection_call_count', 0) + 1
 
-        for name, param in self._get_sgp_protected_params():
-            if kk >= len(self._sgp_feature_mats):
+        for name, param in self._get_protected_params():
+            if kk >= len(self._projection_data):
                 break
 
-            P = self._sgp_feature_mats[kk]
-            if P is not None and param.grad is not None:
-                if P.device != param.device:
-                    P = P.to(param.device)
-                    self._sgp_feature_mats[kk] = P
-
+            data = self._projection_data[kk]
+            if data is not None and param.grad is not None:
                 sz = param.grad.data.size(0)
                 flat_grad = param.grad.data.view(sz, -1)
 
                 grad_norm_before = flat_grad.norm().item()
-                proj = torch.mm(flat_grad, P)
+                proj = projection_memory._apply_projection(flat_grad, data)
                 proj_norm = proj.norm().item()
                 param.grad.data = param.grad.data - proj.view(param.grad.shape)
                 grad_norm_after = param.grad.data.norm().item()
 
-                # Log every 100 calls
-                if self._sgp_call_count % 100 == 1:
-                    print("[SGP proj] layer={} P_shape={} grad_before={:.4f} projected={:.4f} grad_after={:.4f}".format(
-                        name, list(P.shape), grad_norm_before, proj_norm, grad_norm_after))
+                if self._projection_call_count % 100 == 1:
+                    print("[CL:{} proj] layer={} grad_before={:.4f} projected={:.4f} grad_after={:.4f}".format(
+                        self._cl_method.upper(), name, grad_norm_before, proj_norm, grad_norm_after))
 
             kk += 1
 
@@ -422,23 +433,22 @@ class AMPCLAgent(amp_agent.AMPAgent):
         if not self._enable_cbp or len(self._cbp_modules) == 0:
             return
 
-        # Build per-layer feature_mat / next_feature_mat from SGP projection matrices
         for idx, cbp_mod in enumerate(self._cbp_modules):
             if not cbp_mod.training:
                 continue
             if cbp_mod.features is None:
                 continue
 
+            # CBP needs dense P matrices regardless of CL method
             feature_mat = None
             next_feature_mat = None
-            if idx < len(self._sgp_feature_mats):
-                feature_mat = self._sgp_feature_mats[idx]
-            if (idx + 1) < len(self._sgp_feature_mats):
-                next_feature_mat = self._sgp_feature_mats[idx + 1]
+            if idx < len(self._projection_data):
+                feature_mat = projection_memory.get_projection_matrix(self._projection_data[idx])
+            if (idx + 1) < len(self._projection_data):
+                next_feature_mat = projection_memory.get_projection_matrix(self._projection_data[idx + 1])
 
             features_to_replace = cbp_mod.reinit(feature_mat, next_feature_mat)
 
-            # Reset optimizer state for replaced neurons
             if features_to_replace.numel() > 0:
                 cbp_mod.update_optim_params_adam(
                     features_to_replace, self._actor_optimizer._optimizer
@@ -450,35 +460,37 @@ class AMPCLAgent(amp_agent.AMPAgent):
 
     def _apply_anchor_correction(self):
         """Correct weight drift for reset neurons in the protected subspace."""
-        if not self._enable_cbp or len(self._sgp_anchors) == 0:
+        if not self._enable_cbp or len(self._projection_anchors) == 0:
             return
 
         kk = 0
         with torch.no_grad():
             for name, param in self._model._actor_layers.named_parameters():
                 if "weight" in name and param.dim() > 1:
-                    if kk >= len(self._sgp_anchors):
+                    if kk >= len(self._projection_anchors):
                         break
 
-                    Anchor = self._sgp_anchors[kk]
-                    P = self._sgp_feature_mats[kk] if kk < len(self._sgp_feature_mats) else None
+                    Anchor = self._projection_anchors[kk]
+                    data = self._projection_data[kk] if kk < len(self._projection_data) else None
                     cbp_module = self._layer_cbp_map.get(param)
 
-                    if (cbp_module is not None and Anchor is not None and P is not None
+                    if (cbp_module is not None and Anchor is not None and data is not None
                             and getattr(cbp_module, 'reset_mask', None) is not None):
 
                         device = param.device
                         Anchor = Anchor.to(device)
-                        P = P.to(device)
-                        Mask = cbp_module.reset_mask.to(device)
+                        P = projection_memory.get_projection_matrix(data)
+                        if P is not None:
+                            P = P.to(device)
+                            Mask = cbp_module.reset_mask.to(device)
 
-                        sz = param.data.size(0)
-                        flat_w = param.data.view(sz, -1)
-                        current_proj = torch.mm(flat_w, P)
-                        delta = current_proj - Anchor
-                        mask_broadcast = Mask.view(-1, 1)
-                        delta_masked = delta * mask_broadcast
-                        param.data = param.data - delta_masked.view(param.shape)
+                            sz = param.data.size(0)
+                            flat_w = param.data.view(sz, -1)
+                            current_proj = torch.mm(flat_w, P)
+                            delta = current_proj - Anchor
+                            mask_broadcast = Mask.view(-1, 1)
+                            delta_masked = delta * mask_broadcast
+                            param.data = param.data - delta_masked.view(param.shape)
 
                     kk += 1
 
@@ -486,56 +498,72 @@ class AMPCLAgent(amp_agent.AMPAgent):
     # Task transition: prepare for a new CL task
     # ------------------------------------------------------------------
 
-    def prepare_for_new_task(self, task_id, sgp_feature_mats, sgp_anchors):
+    def prepare_for_new_task(self, task_id, projection_data=None,
+                             projection_anchors=None, ewc_memory=None):
         """Prepare the agent for continual learning of a new motion task.
 
         Args:
             task_id: Integer ID of the new task.
-            sgp_feature_mats: List of projection matrices from SGPMemoryBank.
-            sgp_anchors: List of anchor weight projections from SGPMemoryBank.
+            projection_data: Per-layer projection data from ProjectionMemoryBank
+                             (P matrices for GPM, or {"U", "alpha"} dicts for SGP).
+            projection_anchors: Per-layer anchor weight projections.
+            ewc_memory: EWCMemory instance (for cl_method="ewc").
         """
-        Logger.print("Preparing for CL task {} ...".format(task_id))
+        Logger.print("Preparing for CL task {} (method={}) ...".format(task_id, self._cl_method))
 
         # 1. Set task_id on all CBP modules (resets utility tracking)
         if self._enable_cbp:
             for cbp_mod in self._cbp_modules:
                 cbp_mod.set_task_id(task_id)
 
-        # 2. Freeze bias parameters in actor (SGP only protects weights)
+        # 2. Freeze bias parameters in actor
         self._freeze_actor_bias()
 
-        # 3. Store SGP projection matrices and anchors
-        self._sgp_feature_mats = sgp_feature_mats
-        self._sgp_anchors = sgp_anchors
-        self._sgp_call_count = 0
+        # 3. Store projection data (GPM/SGP)
+        if projection_data is not None:
+            self._projection_data = projection_data
+        else:
+            self._projection_data = []
+        if projection_anchors is not None:
+            self._projection_anchors = projection_anchors
+        else:
+            self._projection_anchors = []
+        self._projection_call_count = 0
 
-        # Pass feature matrices to SGP_Adam optimizer if applicable
-        if isinstance(self._actor_optimizer, mp_optimizer.SGPAdamOptimizer):
-            self._actor_optimizer.set_feature_matrices(sgp_feature_mats)
+        # Pass projection data to ProjectionAdam optimizer if applicable
+        if isinstance(self._actor_optimizer, mp_optimizer.ProjectionAdamOptimizer):
+            self._actor_optimizer.set_projection_data(self._projection_data)
 
-        num_valid = sum(1 for p in sgp_feature_mats if p is not None)
-        Logger.print("SGP: {} projection matrices loaded ({} valid)".format(
-            len(sgp_feature_mats), num_valid))
-        for i, P in enumerate(sgp_feature_mats):
-            if P is not None:
-                Logger.print("  P[{}]: shape={}, rank~={}".format(
-                    i, list(P.shape), (P.diagonal() > 0.5).sum().item()))
+        # 4. Store EWC memory
+        if ewc_memory is not None:
+            self._ewc_memory = ewc_memory
 
-        # 4. Reset discriminator for new motion
+        # 5. Log projection info
+        if self._cl_method in ("gpm", "sgp") and self._projection_data:
+            num_valid = sum(1 for p in self._projection_data if p is not None)
+            Logger.print("{}: {} projection matrices loaded ({} valid)".format(
+                self._cl_method.upper(), len(self._projection_data), num_valid))
+            for i, data in enumerate(self._projection_data):
+                if data is not None:
+                    if isinstance(data, dict):
+                        Logger.print("  [{}]: U shape={}, alpha=[{:.4f}, {:.4f}]".format(
+                            i, list(data["U"].shape),
+                            data["alpha"].min().item(), data["alpha"].max().item()))
+                    else:
+                        Logger.print("  [{}]: P shape={}, rank~={}".format(
+                            i, list(data.shape), (data.diagonal() > 0.5).sum().item()))
+
+        # 6. Reset discriminator for new motion
         self._reset_discriminator()
 
-        # 5. Update motion embedding
+        # 7. Update motion embedding
         self.set_current_motion(task_id)
 
         Logger.print("CL task {} preparation complete".format(task_id))
         return
 
     def _freeze_actor_bias(self):
-        """Freeze all bias parameters in actor hidden layers and output head.
-
-        SGP projects weight gradients but cannot protect bias. Freezing bias
-        after the first task prevents drift that would corrupt learned motions.
-        """
+        """Freeze all bias parameters in actor hidden layers and output head."""
         frozen_count = 0
         for name, param in self._model._actor_layers.named_parameters():
             if "bias" in name:
@@ -552,9 +580,9 @@ class AMPCLAgent(amp_agent.AMPAgent):
         # Rebuild actor optimizer without frozen params
         actor_config = self._config["actor_optimizer"]
         actor_params = [p for p in self._model.get_actor_params() if p.requires_grad]
-        if actor_config["type"] == "SGP_Adam":
-            self._actor_optimizer = mp_optimizer.SGPAdamOptimizer(actor_config, actor_params)
-            Logger.print("Using SGP_Adam optimizer (double projection)")
+        if actor_config["type"] in ("SGP_Adam", "Projection_Adam"):
+            self._actor_optimizer = mp_optimizer.ProjectionAdamOptimizer(actor_config, actor_params)
+            Logger.print("Using ProjectionAdam optimizer (double projection)")
         else:
             self._actor_optimizer = mp_optimizer.MPOptimizer(actor_config, actor_params)
         return
@@ -591,12 +619,12 @@ class AMPCLAgent(amp_agent.AMPAgent):
     def save(self, out_file):
         if mp_util.is_root_proc():
             state_dict = self.state_dict()
-            # Add CL metadata
             cl_state = {
                 'model_state': state_dict,
                 'current_task_id': self._current_task_id,
-                'sgp_feature_mats': self._sgp_feature_mats,
-                'sgp_anchors': self._sgp_anchors,
+                'cl_method': self._cl_method,
+                'projection_data': self._projection_data,
+                'projection_anchors': self._projection_anchors,
             }
             torch.save(cl_state, out_file)
         return
@@ -604,12 +632,15 @@ class AMPCLAgent(amp_agent.AMPAgent):
     def load(self, in_file):
         data = torch.load(in_file, map_location=self._device, weights_only=False)
 
-        # Support both CL-format and standard format checkpoints
+        # Support both new format, old format, and standard format checkpoints
         if isinstance(data, dict) and 'model_state' in data:
             self.load_state_dict(data['model_state'], strict=False)
             self._current_task_id = data.get('current_task_id', 0)
-            self._sgp_feature_mats = data.get('sgp_feature_mats', [])
-            self._sgp_anchors = data.get('sgp_anchors', [])
+            # Support both old (sgp_*) and new (projection_*) key names
+            self._projection_data = data.get('projection_data',
+                                              data.get('sgp_feature_mats', []))
+            self._projection_anchors = data.get('projection_anchors',
+                                                 data.get('sgp_anchors', []))
         else:
             # Standard checkpoint (e.g., from pre-trained AMP model)
             self.load_state_dict(data, strict=False)
@@ -625,4 +656,8 @@ class AMPCLAgent(amp_agent.AMPAgent):
         # Log CBP replacement stats
         total_replacements = sum(cbp.total_replacements for cbp in self._cbp_modules)
         self._logger.log("CBP_Total_Replacements", total_replacements)
+
+        # Log EWC loss if available
+        if "ewc_loss" in train_info:
+            self._logger.log("EWC_Loss", train_info["ewc_loss"])
         return

@@ -83,7 +83,7 @@ class MPOptimizer():
 
         if (optimizer_type == "SGD"):
             optimizer = torch.optim.SGD(param_list, lr, momentum=0.0, weight_decay=weight_decay)
-        elif (optimizer_type == "Adam" or optimizer_type == "SGP_Adam"):
+        elif optimizer_type in ("Adam", "SGP_Adam", "Projection_Adam"):
             optimizer = torch.optim.AdamW(param_list, lr, weight_decay=weight_decay)
         else:
             assert(False), "Unsupported optimizer type: " + optimizer_type
@@ -123,15 +123,16 @@ class MPOptimizer():
         return
 
 
-class SGPAdamOptimizer():
-    """Adam optimizer with double gradient projection for SGP-compatible CL.
+class ProjectionAdamOptimizer():
+    """Adam optimizer with double gradient projection for CL.
 
     For protected parameters, projects gradients both before and after Adam's
     momentum/variance update. The second projection corrects direction drift
     caused by Adam's per-element adaptive scaling (m / sqrt(v)), which would
     otherwise rotate the update back into the protected subspace.
 
-    When no feature matrices are set (task 0), behaves as standard Adam.
+    Supports both GPM (P matrix) and SGP (U + alpha dict) projection formats.
+    When no projection data is set (task 0), behaves as standard Adam.
     """
     CHECK_SYNC_STEPS = 1000
 
@@ -141,7 +142,7 @@ class SGPAdamOptimizer():
         self._beta1 = float(config.get("beta1", 0.9))
         self._beta2 = float(config.get("beta2", 0.999))
         self._eps = float(config.get("eps", 1e-8))
-        self._max_grad_norm = float(config.get("sgp_max_grad_norm", 50.0))
+        self._max_grad_norm = float(config.get("projection_max_grad_norm", 50.0))
         self._steps = 0
         self._log_interval = 100
 
@@ -150,8 +151,8 @@ class SGPAdamOptimizer():
         self._v = [torch.zeros_like(p) for p in param_list]
         self._t = [1 for _ in param_list]
 
-        # SGP projection matrices (set when new task starts)
-        self._feature_mats = []
+        # Projection data (set when new task starts)
+        self._projection_data = []
 
         if (mp_util.enable_mp()):
             self._param_buffer = self._build_param_buffer()
@@ -159,11 +160,26 @@ class SGPAdamOptimizer():
         self.sync()
         return
 
-    def set_feature_matrices(self, feature_mats):
-        self._feature_mats = feature_mats if feature_mats else []
+    def set_projection_data(self, projection_data):
+        self._projection_data = projection_data if projection_data else []
+
+    def _project(self, flat, data):
+        """Apply projection to flat [out_dim, in_dim] tensor.
+
+        Handles both GPM (P matrix) and SGP ({"U", "alpha"} dict) formats.
+        Returns the projected component (to be subtracted from flat).
+        """
+        if isinstance(data, dict):
+            U = data["U"].to(flat.device)
+            alpha = data["alpha"].to(flat.device)
+            proj = torch.mm(flat, U)
+            proj = proj * alpha.unsqueeze(0)
+            return torch.mm(proj, U.t())
+        else:
+            P = data.to(flat.device)
+            return torch.mm(flat, P)
 
     def step(self, loss):
-        # Zero gradients
         for p in self._param_list:
             if p.grad is not None:
                 p.grad.zero_()
@@ -182,20 +198,15 @@ class SGPAdamOptimizer():
 
             sz = param.grad.data.size(0)
 
-            # Check if this param has a projection matrix
-            P = None
-            if (k < len(self._feature_mats)
-                    and self._feature_mats[k] is not None
-                    and param.dim() > 1):
-                P = self._feature_mats[k]
-                if P.device != param.device:
-                    P = P.to(param.device)
-                    self._feature_mats[k] = P
+            # Check if this param has projection data
+            has_proj = (k < len(self._projection_data)
+                        and self._projection_data[k] is not None
+                        and param.dim() > 1)
 
             # 1st projection: project gradient before Adam update
-            if P is not None:
+            if has_proj:
                 flat_grad = param.grad.data.view(sz, -1)
-                proj = torch.mm(flat_grad, P)
+                proj = self._project(flat_grad, self._projection_data[k])
                 param.grad.data = param.grad.data - proj.view(param.grad.shape)
 
             # Adam momentum / variance update
@@ -207,21 +218,20 @@ class SGPAdamOptimizer():
             grad_mod = m_hat / (torch.sqrt(v_hat) + self._eps)
 
             # 2nd projection: correct Adam's adaptive-scaling drift
-            if P is not None:
+            if has_proj:
                 grad_before = grad_mod.norm().item()
 
                 flat_mod = grad_mod.view(sz, -1)
-                proj2 = torch.mm(flat_mod, P)
+                proj2 = self._project(flat_mod, self._projection_data[k])
                 grad_mod = grad_mod - proj2.view(param.size())
 
-                # Per-layer gradient clipping
                 mod_norm = grad_mod.norm().item()
                 if mod_norm > self._max_grad_norm:
                     grad_mod.mul_(self._max_grad_norm / (mod_norm + 1e-8))
 
                 if do_log:
                     leak = proj2.norm().item()
-                    print("[SGP_Adam] layer={} adam_norm={:.4f} leak={:.4f} final={:.4f}".format(
+                    print("[CL:ProjAdam] layer={} adam_norm={:.4f} leak={:.4f} final={:.4f}".format(
                         k, grad_before, leak, mod_norm))
 
             param.data = param.data - self._lr * grad_mod
@@ -271,3 +281,7 @@ class SGPAdamOptimizer():
         mp_util.reduce_inplace_mean(self._param_buffer)
         torch.nn.utils.vector_to_parameters(self._param_buffer, grad_list)
         return
+
+
+# Backward-compatible alias
+SGPAdamOptimizer = ProjectionAdamOptimizer
