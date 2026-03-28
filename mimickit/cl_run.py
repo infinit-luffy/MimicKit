@@ -247,10 +247,16 @@ def print_performance_matrix(perf_matrix, stage_names):
     Logger.print("")
 
 
-def collect_obs_for_projection(env, agent, n_steps=20):
+def collect_obs_for_projection(env, agent, n_steps=300, max_envs=256):
     """Run trained policy and collect observations for feature extraction.
 
     Returns observations concatenated with motion one-hot, matching actor input.
+
+    Args:
+        n_steps: Number of rollout steps.
+        max_envs: Max environments to sample from per step. If the env has more
+                  environments, only the first max_envs are used. This bounds
+                  memory and SVD cost regardless of training num_envs.
     """
     agent.eval()
     obs, info = env.reset()
@@ -262,7 +268,7 @@ def collect_obs_for_projection(env, agent, n_steps=20):
             norm_obs = agent._obs_norm.normalize(obs)
             motion_onehot = agent._motion_onehot_buf
             actor_input = torch.cat([norm_obs, motion_onehot], dim=-1)
-            obs_list.append(actor_input.clone())
+            obs_list.append(actor_input[:max_envs].clone())
 
             next_obs, r, done, next_info = env.step(action)
             obs = next_obs
@@ -353,7 +359,10 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, cl_mem,
     if cl_method in ("gpm", "sgp"):
         Logger.print("Updating {} memory for task {} ({})...".format(
             cl_method.upper(), task_id, stage_name))
-        obs_data = collect_obs_for_projection(env, agent, n_steps=20)
+        cl_n_steps = args.parse_int("cl_n_steps", 300)
+        cl_max_envs = args.parse_int("cl_max_envs", 256)
+        obs_data = collect_obs_for_projection(env, agent, n_steps=cl_n_steps,
+                                              max_envs=cl_max_envs)
         cl_mem.update_memory(
             agent._model._actor_layers, obs_data, task_id,
             output_layer=agent._model._action_dist
@@ -362,7 +371,8 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, cl_mem,
             cl_mem.num_tasks))
     elif cl_method == "ewc":
         Logger.print("Computing Fisher for task {} ({})...".format(task_id, stage_name))
-        fisher = cl_mem.compute_fisher(agent, env, n_steps=20)
+        cl_n_steps = args.parse_int("cl_n_steps", 300)
+        fisher = cl_mem.compute_fisher(agent, env, n_steps=cl_n_steps)
         cl_mem.register_task(agent, fisher)
 
     # F. Save model and memory
