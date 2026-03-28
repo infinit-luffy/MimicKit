@@ -61,12 +61,14 @@ class EWCMemory:
             with torch.no_grad():
                 action, _ = agent._decide_action(obs, info)
 
-            # Compute log_prob WITH gradients
+            # Compute log_prob WITH gradients, sampling fresh actions from pi
+            # (Fisher = E_{a~pi}[grad^2], must sample from current policy)
             norm_obs = agent._obs_norm.normalize(obs)
             motion_onehot = agent._motion_onehot_buf
             a_dist = agent._model.eval_actor(norm_obs, motion_onehot)
-            norm_a = agent._a_norm.normalize(action)
-            log_prob = a_dist.log_prob(norm_a).mean()
+            with torch.no_grad():
+                sampled_norm_a = a_dist.sample()
+            log_prob = a_dist.log_prob(sampled_norm_a).mean()
 
             agent._model.zero_grad()
             log_prob.backward()

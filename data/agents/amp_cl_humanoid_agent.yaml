@@ -8,8 +8,9 @@ cbp_maturity_threshold: 1000
 
 # CL method: "gpm", "sgp", or "ewc"
 cl_method: "gpm"
-projection_threshold: 0.98
-gpm_ratio_threshold: 0.02
+projection_threshold: 0.995
+projection_threshold_inc: 0.0
+sgp_scale_coff: 25
 
 # EWC parameters (only used when cl_method: "ewc")
 ewc_lambda: 1000.0

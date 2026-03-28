@@ -136,9 +136,8 @@ class ProjectionMemoryBank:
         for name in layer_names:
             if name in raw_activations:
                 R = torch.cat(raw_activations[name], dim=0)  # [N, feat_dim]
-                act = R.t().contiguous()  # [feat_dim, N]
-                G = torch.mm(act, act.t())  # [feat_dim, feat_dim]
-                result.append({"G": G, "act": act, "name": name})
+                act = R.t().contiguous().cpu()  # [feat_dim, N] on CPU for SVD
+                result.append({"act": act, "name": name})
                 print("[CL:proj] {}: [{}, {}] samples".format(
                     name, R.shape[1], R.shape[0]))
             else:
@@ -158,34 +157,32 @@ class ProjectionMemoryBank:
                 if data is None:
                     self.feature_list.append(None)
                     continue
-                G = data["G"]
-                U, eigvals, _ = torch.svd(G)
+                act = data["act"]  # [feat_dim, N]
+                U, S, _ = torch.linalg.svd(act, full_matrices=False)  # U: [feat_dim, min(feat_dim,N)]
 
-                sval_total = eigvals.sum()
-                sval_ratio = eigvals / (sval_total + 1e-8)
+                sval_total = (S ** 2).sum()
+                sval_ratio = (S ** 2) / (sval_total + 1e-8)
                 r = (torch.cumsum(sval_ratio, dim=0) < threshold).sum().item() + 1
                 r = min(r, U.shape[1])
 
                 self.feature_list.append(U[:, :r].to(self.device))
-                print("[CL:GPM] Layer {}: r={}/{}".format(i, r, G.shape[0]))
+                print("[CL:GPM] Layer {}: r={}/{}".format(i, r, act.shape[0]))
         else:
             for i, data in enumerate(activations):
                 if data is None or i >= len(self.feature_list) or self.feature_list[i] is None:
                     continue
-                G = data["G"]
-                U_old = self.feature_list[i].to(G.device)
+                act = data["act"]  # [feat_dim, N]
+                U_old = self.feature_list[i].to(act.device)
 
-                sval_total = torch.trace(G)
+                U1, S1, _ = torch.linalg.svd(act, full_matrices=False)
+                sval_total = (S1 ** 2).sum()
 
-                # Residual Gram: (I - P) @ G @ (I - P), where P = U_old @ U_old^T
-                P = torch.mm(U_old, U_old.t())
-                I_P = torch.eye(G.shape[0], device=G.device) - P
-                G_hat = I_P @ G @ I_P
-                U, eigvals, _ = torch.svd(G_hat)
-                eigvals = torch.clamp(eigvals, min=0)
+                # Residual activation: act_hat = (I - P) @ act
+                act_hat = act - U_old @ (U_old.t() @ act)
+                U, S, _ = torch.linalg.svd(act_hat, full_matrices=False)
 
-                sval_hat = eigvals.sum()
-                sval_ratio = eigvals / (sval_total + 1e-8)
+                sval_hat = (S ** 2).sum()
+                sval_ratio = (S ** 2) / (sval_total + 1e-8)
                 accumulated = ((sval_total - sval_hat) / (sval_total + 1e-8)).item()
 
                 r = 0
@@ -225,12 +222,11 @@ class ProjectionMemoryBank:
                     self.feature_list.append(None)
                     self.importance_list.append(None)
                     continue
-                G = data["G"]
-                U, eigvals, _ = torch.svd(G)
-                S = torch.sqrt(torch.clamp(eigvals, min=0))
+                act = data["act"]  # [feat_dim, N]
+                U, S, _ = torch.linalg.svd(act, full_matrices=False)
 
-                sval_total = eigvals.sum()
-                sval_ratio = eigvals / (sval_total + 1e-8)
+                sval_total = (S ** 2).sum()
+                sval_ratio = (S ** 2) / (sval_total + 1e-8)
                 r = (torch.cumsum(sval_ratio, dim=0) < threshold).sum().item() + 1
                 r = min(r, U.shape[1])
 
@@ -240,7 +236,7 @@ class ProjectionMemoryBank:
                 self.feature_list.append(U[:, :r].to(self.device))
                 self.importance_list.append(importance.to(self.device))
                 print("[CL:SGP] Layer {}: r={}/{}, imp=[{:.4f},{:.4f}]".format(
-                    i, r, G.shape[0],
+                    i, r, act.shape[0],
                     importance.min().item(), importance.max().item()))
         else:
             # Subsequent tasks: incremental update
@@ -249,37 +245,28 @@ class ProjectionMemoryBank:
                         or self.feature_list[i] is None):
                     continue
                 act = data["act"]  # [feat_dim, N]
-                G = data["G"]
-                U_old = self.feature_list[i].to(G.device)
+                U_old = self.feature_list[i].to(act.device)
                 r_old = U_old.shape[1]
 
-                sval_total = torch.trace(G)
+                _, S1, _ = torch.linalg.svd(act, full_matrices=False)
+                sval_total = (S1 ** 2).sum()
 
-                # --- Surrogate importance on old basis ---
-                # Project activations onto existing basis: act_proj = P @ act
-                # G_proj = P @ G @ P (Gram of projected activations)
-                P = torch.mm(U_old, U_old.t())
-                G_proj = P @ G @ P
-                Uc, eigvals_proj, _ = torch.svd(G_proj)
-                eigvals_proj = torch.clamp(eigvals_proj, min=0)
-                r_proj = min(r_old, (eigvals_proj > 1e-8).sum().item())
+                # --- Surrogate importance on old basis (ref: sgp.py Eq-4) ---
+                # act_proj = U_old @ U_old^T @ act
+                act_proj = U_old @ (U_old.t() @ act)  # [feat_dim, N]
+                Uc, Sc, _ = torch.linalg.svd(act_proj, full_matrices=False)
+                r_proj = min(r_old, (Sc > 1e-8).sum().item())
                 r_proj = max(r_proj, 1)
-
-                Sc_proj = torch.sqrt(eigvals_proj[:r_proj])
-                # importance_new_on_old[j] = how much new task excites j-th old direction
                 importance_new_on_old = torch.sqrt(
-                    ((U_old.t() @ Uc[:, :r_proj]) ** 2) @ (Sc_proj ** 2)
+                    ((U_old.t() @ Uc[:, :r_proj]) ** 2) @ (Sc[:r_proj] ** 2)
                 )
 
                 # --- Residual for new directions ---
-                I_P = torch.eye(G.shape[0], device=G.device) - P
-                G_hat = I_P @ G @ I_P
-                U, eigvals_hat, _ = torch.svd(G_hat)
-                eigvals_hat = torch.clamp(eigvals_hat, min=0)
-                S_hat = torch.sqrt(eigvals_hat)
+                act_hat = act - act_proj  # (I - P) @ act
+                U, S_hat, _ = torch.linalg.svd(act_hat, full_matrices=False)
 
-                sval_hat = eigvals_hat.sum()
-                sval_ratio = eigvals_hat / (sval_total + 1e-8)
+                sval_hat = (S_hat ** 2).sum()
+                sval_ratio = (S_hat ** 2) / (sval_total + 1e-8)
                 accumulated = ((sval_total - sval_hat) / (sval_total + 1e-8)).item()
 
                 r = 0
@@ -290,7 +277,7 @@ class ProjectionMemoryBank:
                     else:
                         break
 
-                imp_old = self.importance_list[i].to(G.device)
+                imp_old = self.importance_list[i].to(act.device)
 
                 if r == 0:
                     # No new dimensions needed -- update importance only
@@ -303,8 +290,7 @@ class ProjectionMemoryBank:
                     print("[CL:SGP] Layer {}: skip expand, imp updated".format(i))
                 else:
                     # Expand basis + update importance
-                    S_new = S_hat[:r]
-                    importance = torch.cat([importance_new_on_old, S_new])
+                    importance = torch.cat([importance_new_on_old, S_hat[:r]])
                     importance = ((c + 1) * importance) / (
                         c * importance + importance.max() + 1e-8)
                     importance[:r_old] = torch.clamp(
@@ -412,12 +398,12 @@ class ProjectionMemoryBank:
             if data is None:
                 features.append(None)
                 continue
-            G = data["G"]
-            U, S, V = torch.svd(G)
-            total_variance = torch.cumsum(S, dim=0)
-            variance_ratio = total_variance / (torch.sum(S) + 1e-8)
-            k = (variance_ratio < self.threshold).sum().item()
-            k = max(k, 1)
+            act = data["act"]
+            U, S, _ = torch.linalg.svd(act, full_matrices=False)
+            sval_total = (S ** 2).sum()
+            sval_ratio = (S ** 2) / (sval_total + 1e-8)
+            k = (torch.cumsum(sval_ratio, dim=0) < self.threshold).sum().item() + 1
+            k = min(max(k, 1), U.shape[1])
             features.append({"U": U[:, :k], "S": S[:k]})
         return features
 
