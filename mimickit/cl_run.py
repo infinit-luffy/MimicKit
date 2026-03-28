@@ -285,7 +285,7 @@ def evaluate_motion(agent, env, motion_id, num_episodes=10):
 
 
 def train_cl_stage(env, stage_config, task_id, device, in_model_file, cl_mem,
-                   curriculum_file, cl_method="gpm"):
+                   curriculum_file, cl_method="gpm", cl_n_steps=300, cl_max_envs=256):
     """Train one CL stage (one motion), reusing the existing env.
 
     Args:
@@ -359,8 +359,6 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, cl_mem,
     if cl_method in ("gpm", "sgp"):
         Logger.print("Updating {} memory for task {} ({})...".format(
             cl_method.upper(), task_id, stage_name))
-        cl_n_steps = args.parse_int("cl_n_steps", 300)
-        cl_max_envs = args.parse_int("cl_max_envs", 256)
         obs_data = collect_obs_for_projection(env, agent, n_steps=cl_n_steps,
                                               max_envs=cl_max_envs)
         cl_mem.update_memory(
@@ -371,7 +369,6 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, cl_mem,
             cl_mem.num_tasks))
     elif cl_method == "ewc":
         Logger.print("Computing Fisher for task {} ({})...".format(task_id, stage_name))
-        cl_n_steps = args.parse_int("cl_n_steps", 300)
         fisher = cl_mem.compute_fisher(agent, env, n_steps=cl_n_steps)
         cl_mem.register_task(agent, fisher)
 
@@ -551,7 +548,9 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
             in_model_file=in_model_file,
             cl_mem=cl_mem,
             curriculum_file=curriculum_config_file,
-            cl_method=cl_method
+            cl_method=cl_method,
+            cl_n_steps=args.parse_int("cl_n_steps", 300),
+            cl_max_envs=args.parse_int("cl_max_envs", 256)
         )
 
         in_model_file = out_model_file
