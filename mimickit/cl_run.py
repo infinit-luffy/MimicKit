@@ -478,15 +478,15 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
     if cl_method in ("gpm", "sgp"):
         threshold = args.parse_float(
             "threshold",
-            agent_cfg.get("projection_threshold", agent_cfg.get("sgp_threshold", 0.98)) if agent_file else 0.98
+            agent_cfg.get("projection_threshold", agent_cfg.get("sgp_threshold", 0.98))
         )
         threshold_inc = args.parse_float(
             "threshold_inc",
-            agent_cfg.get("projection_threshold_inc", 0.005) if agent_file else 0.005
+            agent_cfg.get("projection_threshold_inc", 0.0)
         )
         scale_coff = args.parse_float(
             "scale_coff",
-            agent_cfg.get("sgp_scale_coff", 5) if agent_file else 5
+            agent_cfg.get("sgp_scale_coff", 25)
         )
         cl_mem = projection_memory.ProjectionMemoryBank(
             device=device, threshold=threshold, method=cl_method,
