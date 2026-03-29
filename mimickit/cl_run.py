@@ -30,12 +30,189 @@ import envs.env_builder as env_builder
 import learning.agent_builder as agent_builder
 import learning.cl.projection_memory as projection_memory
 import learning.cl.ewc_memory as ewc_memory
+import learning.cl.projection_memory_ref as projection_memory_ref
+import learning.cl.ewc_memory_ref as ewc_memory_ref
 import continual_run as cl_base
 import run as run_lib
 from util.logger import Logger
 import util.mp_util as mp_util
 
 import torch
+
+
+PROJECTION_METHODS = ("gpm", "sgp", "gpm_ref", "sgp_ref")
+EWC_METHODS = ("ewc", "ewc_ref")
+
+
+def _flatten_tensor_stats(tensors):
+    valid = [t.detach().float().reshape(-1) for t in tensors if t is not None and t.numel() > 0]
+    if not valid:
+        return {
+            "num_tensors": 0,
+            "num_values": 0,
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "l1": 0.0,
+            "l2": 0.0,
+        }
+
+    flat = torch.cat(valid, dim=0)
+    return {
+        "num_tensors": len(valid),
+        "num_values": int(flat.numel()),
+        "mean": float(flat.mean().item()),
+        "std": float(flat.std(unbiased=False).item()),
+        "min": float(flat.min().item()),
+        "max": float(flat.max().item()),
+        "l1": float(flat.abs().sum().item()),
+        "l2": float(flat.norm().item()),
+    }
+
+
+def summarize_projection_memory(cl_mem):
+    layer_stats = []
+    valid_layers = 0
+    total_rank = 0
+    total_dim = 0
+
+    for idx, U in enumerate(getattr(cl_mem, "feature_list", [])):
+        if U is None:
+            layer_stats.append({"layer": idx, "rank": 0, "feat_dim": 0, "rank_ratio": 0.0})
+            continue
+
+        rank = int(U.shape[1])
+        feat_dim = int(U.shape[0])
+        valid_layers += 1
+        total_rank += rank
+        total_dim += feat_dim
+
+        layer_info = {
+            "layer": idx,
+            "rank": rank,
+            "feat_dim": feat_dim,
+            "rank_ratio": float(rank / max(feat_dim, 1)),
+        }
+
+        if hasattr(cl_mem, "importance_list") and idx < len(cl_mem.importance_list):
+            alpha = cl_mem.importance_list[idx]
+            if alpha is not None and alpha.numel() > 0:
+                alpha = alpha.detach().float()
+                layer_info.update({
+                    "alpha_mean": float(alpha.mean().item()),
+                    "alpha_std": float(alpha.std(unbiased=False).item()),
+                    "alpha_min": float(alpha.min().item()),
+                    "alpha_max": float(alpha.max().item()),
+                })
+
+        layer_stats.append(layer_info)
+
+    return {
+        "type": type(cl_mem).__name__,
+        "method": getattr(cl_mem, "method", None),
+        "num_tasks": int(getattr(cl_mem, "num_tasks", 0)),
+        "num_layers": len(getattr(cl_mem, "feature_list", [])),
+        "valid_layers": valid_layers,
+        "total_rank": total_rank,
+        "total_dim": total_dim,
+        "mean_rank_ratio": float(total_rank / max(total_dim, 1)),
+        "alpha_stats": _flatten_tensor_stats(
+            [imp for imp in getattr(cl_mem, "importance_list", []) if imp is not None]
+        ),
+        "layers": layer_stats,
+    }
+
+
+def summarize_projection_data(proj_data):
+    layer_stats = []
+    valid_layers = 0
+    total_rank = 0
+    total_dim = 0
+
+    for idx, data in enumerate(proj_data):
+        if data is None:
+            layer_stats.append({"layer": idx, "rank": 0, "feat_dim": 0, "rank_ratio": 0.0})
+            continue
+
+        valid_layers += 1
+        if isinstance(data, dict):
+            U = data["U"]
+            alpha = data["alpha"].detach().float()
+            rank = int(U.shape[1])
+            feat_dim = int(U.shape[0])
+            layer_stats.append({
+                "layer": idx,
+                "rank": rank,
+                "feat_dim": feat_dim,
+                "rank_ratio": float(rank / max(feat_dim, 1)),
+                "alpha_mean": float(alpha.mean().item()),
+                "alpha_std": float(alpha.std(unbiased=False).item()),
+                "alpha_min": float(alpha.min().item()),
+                "alpha_max": float(alpha.max().item()),
+            })
+        else:
+            P = data.detach().float()
+            feat_dim = int(P.shape[0])
+            diag = P.diagonal()
+            rank = int((diag.abs() > 1e-6).sum().item())
+            layer_stats.append({
+                "layer": idx,
+                "rank": rank,
+                "feat_dim": feat_dim,
+                "rank_ratio": float(rank / max(feat_dim, 1)),
+                "proj_trace": float(diag.sum().item()),
+            })
+
+        total_rank += rank
+        total_dim += feat_dim
+
+    return {
+        "valid_layers": valid_layers,
+        "total_rank": total_rank,
+        "total_dim": total_dim,
+        "mean_rank_ratio": float(total_rank / max(total_dim, 1)),
+        "layers": layer_stats,
+    }
+
+
+def summarize_fisher(fisher):
+    stats = _flatten_tensor_stats(list(fisher.values()))
+    stats["num_params"] = len(fisher)
+    return stats
+
+
+def summarize_ewc_memory(cl_mem):
+    if getattr(cl_mem, "online", False):
+        fisher = getattr(cl_mem, "_online_fisher", {})
+        params = getattr(cl_mem, "_online_params", {})
+        return {
+            "type": type(cl_mem).__name__,
+            "online": True,
+            "num_tasks": int(getattr(cl_mem, "_task_count", 1 if fisher else 0)),
+            "num_params": len(params),
+            "fisher_stats": summarize_fisher(fisher),
+        }
+
+    tasks = getattr(cl_mem, "tasks", [])
+    fisher_tensors = []
+    for task in tasks:
+        fisher_tensors.extend(task.get("fisher", {}).values())
+
+    return {
+        "type": type(cl_mem).__name__,
+        "online": False,
+        "num_tasks": len(tasks),
+        "num_params_last_task": len(tasks[-1]["params"]) if tasks else 0,
+        "fisher_stats_all_tasks": _flatten_tensor_stats(fisher_tensors),
+    }
+
+
+def extract_metric_row(eval_row, metric_key):
+    return {
+        task_name: float(task_metrics.get(metric_key, 0.0))
+        for task_name, task_metrics in eval_row.items()
+    }
 
 
 def build_run_dir(base_out_dir, agent_name, rand_seed):
@@ -138,8 +315,7 @@ def evaluate_after_stage(env, stages, current_stage_idx, model_file, device,
                          curriculum, args, num_episodes=10):
     """Evaluate all learned tasks after completing a training stage.
 
-    Returns a dict mapping task names to mean_ep_len values.
-    This is one row of the performance matrix R[current_stage_idx, :].
+    Returns a dict mapping task names to a small metrics dict.
     """
     Logger.print("")
     Logger.print("--- Eval after stage {} ({}) on tasks 0..{} ---".format(
@@ -161,11 +337,15 @@ def evaluate_after_stage(env, stages, current_stage_idx, model_file, device,
         agent.load(model_file)
 
         result = evaluate_motion(agent, env, task_id, num_episodes=num_episodes)
+        mean_return = float(result.get("mean_return", 0.0))
         ep_len = float(result.get("mean_ep_len", 0.0))
-        row[stage_name] = ep_len
+        row[stage_name] = {
+            "mean_return": mean_return,
+            "mean_ep_len": ep_len,
+        }
 
-        Logger.print("  task {} ({}): mean_ep_len={:.1f}".format(
-            task_id, stage_name, ep_len))
+        Logger.print("  task {} ({}): mean_return={:.2f}, mean_ep_len={:.1f}".format(
+            task_id, stage_name, mean_return, ep_len))
 
         del agent
         torch.cuda.empty_cache()
@@ -174,10 +354,10 @@ def evaluate_after_stage(env, stages, current_stage_idx, model_file, device,
 
 
 def compute_cl_metrics(perf_matrix, stage_names):
-    """Compute standard CL metrics from the performance matrix.
+    """Compute standard CL metrics from one scalar performance matrix.
 
     Args:
-        perf_matrix: list[dict], where perf_matrix[i][name] = mean_ep_len
+        perf_matrix: list[dict], where perf_matrix[i][name] is a scalar metric
                      after training stage i on task 'name'.
         stage_names: list of stage name strings in order.
 
@@ -221,11 +401,11 @@ def compute_cl_metrics(perf_matrix, stage_names):
     return metrics
 
 
-def print_performance_matrix(perf_matrix, stage_names):
-    """Pretty-print the performance matrix."""
+def print_performance_matrix(perf_matrix, stage_names, metric_name="metric"):
+    """Pretty-print one scalar performance matrix."""
     Logger.print("")
     Logger.print("=" * 60)
-    Logger.print(" PERFORMANCE MATRIX (mean_ep_len)")
+    Logger.print(" PERFORMANCE MATRIX ({})".format(metric_name))
     Logger.print("=" * 60)
 
     # Header
@@ -320,13 +500,18 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, cl_mem,
     agent = agent_builder.build_agent_from_config(
         stage_config["agent_config"], env, device
     )
+    proj_summary_before = None
+    anchor_summary_before = None
+    memory_summary_after = None
+    fisher_summary = None
+    ewc_summary_after = None
 
     # C. Load previous model + inject CL state
     if task_id > 0 and in_model_file != "":
         Logger.print("Loading previous model from {}".format(in_model_file))
         agent.load(in_model_file)
 
-        if cl_method in ("gpm", "sgp"):
+        if cl_method in PROJECTION_METHODS:
             # Build and inject projection matrices
             Logger.print("Building {} projection matrices from {} tasks...".format(
                 cl_method.upper(), cl_mem.num_tasks))
@@ -335,9 +520,14 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, cl_mem,
                 agent._model._actor_layers, proj_data,
                 output_layer=agent._model._action_dist
             )
+            proj_summary_before = summarize_projection_data(proj_data)
+            anchor_summary_before = {
+                "num_anchors": len(anchors),
+                "anchor_stats": _flatten_tensor_stats([a for a in anchors if a is not None]),
+            }
             agent.prepare_for_new_task(task_id, projection_data=proj_data,
                                         projection_anchors=anchors)
-        elif cl_method == "ewc":
+        elif cl_method in EWC_METHODS:
             agent.prepare_for_new_task(task_id, ewc_memory=cl_mem)
 
     elif task_id == 0:
@@ -356,7 +546,7 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, cl_mem,
     )
 
     # E. Extract features / compute Fisher for memory
-    if cl_method in ("gpm", "sgp"):
+    if cl_method in PROJECTION_METHODS:
         Logger.print("Updating {} memory for task {} ({})...".format(
             cl_method.upper(), task_id, stage_name))
         obs_data = collect_obs_for_projection(env, agent, n_steps=cl_n_steps,
@@ -365,12 +555,19 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, cl_mem,
             agent._model._actor_layers, obs_data, task_id,
             output_layer=agent._model._action_dist
         )
+        memory_summary_after = summarize_projection_memory(cl_mem)
+        Logger.print("Projection summary: total_rank={}, mean_rank_ratio={:.4f}".format(
+            memory_summary_after["total_rank"], memory_summary_after["mean_rank_ratio"]))
         Logger.print("Projection memory updated. Total tasks: {}".format(
             cl_mem.num_tasks))
-    elif cl_method == "ewc":
+    elif cl_method in EWC_METHODS:
         Logger.print("Computing Fisher for task {} ({})...".format(task_id, stage_name))
         fisher = cl_mem.compute_fisher(agent, env, n_steps=cl_n_steps)
+        fisher_summary = summarize_fisher(fisher)
         cl_mem.register_task(agent, fisher)
+        ewc_summary_after = summarize_ewc_memory(cl_mem)
+        Logger.print("Fisher summary: mean={:.6f}, max={:.6f}, l2={:.6f}".format(
+            fisher_summary["mean"], fisher_summary["max"], fisher_summary["l2"]))
 
     # F. Save model and memory
     out_model_file = os.path.join(stage_config["out_dir"], "model.pt")
@@ -386,8 +583,15 @@ def train_cl_stage(env, stage_config, task_id, device, in_model_file, cl_mem,
         "model_file": out_model_file,
         "cl_memory_file": cl_memory_file,
         "init_model_file": in_model_file,
-        "max_samples": int(stage_config["max_samples"])
+        "max_samples": int(stage_config["max_samples"]),
+        "cl_method": cl_method,
+        "projection_summary_before": proj_summary_before,
+        "anchor_summary_before": anchor_summary_before,
+        "projection_memory_summary_after": memory_summary_after,
+        "fisher_summary": fisher_summary,
+        "ewc_summary_after": ewc_summary_after,
     }
+    cl_base.save_yaml(stage_record, os.path.join(stage_config["out_dir"], "stage_metrics.yaml"))
 
     # Cleanup agent only (env is reused)
     del agent
@@ -475,7 +679,7 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
 
     # Create CL memory
     # CLI args override yaml: --threshold, --threshold_inc, --scale_coff, --gpm_mini_batch
-    if cl_method in ("gpm", "sgp"):
+    if cl_method in PROJECTION_METHODS:
         threshold = args.parse_float(
             "threshold",
             agent_cfg.get("projection_threshold", agent_cfg.get("sgp_threshold", 0.98))
@@ -488,20 +692,40 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
             "scale_coff",
             agent_cfg.get("sgp_scale_coff", 25)
         )
-        cl_mem = projection_memory.ProjectionMemoryBank(
-            device=device, threshold=threshold, method=cl_method,
-            threshold_inc=threshold_inc, scale_coff=scale_coff
-        )
+        if cl_method.endswith("_ref"):
+            cl_mem = projection_memory_ref.ReferenceProjectionMemoryBank(
+                device=device,
+                threshold=threshold,
+                method=cl_method.replace("_ref", ""),
+                threshold_inc=threshold_inc,
+                scale_coff=scale_coff,
+            )
+        else:
+            cl_mem = projection_memory.ProjectionMemoryBank(
+                device=device,
+                threshold=threshold,
+                method=cl_method,
+                threshold_inc=threshold_inc,
+                scale_coff=scale_coff,
+            )
         Logger.print("Projection memory: threshold={}, threshold_inc={}, scale_coff={}".format(
             threshold, threshold_inc, scale_coff))
-    elif cl_method == "ewc":
+    elif cl_method in EWC_METHODS:
         ewc_lambda = agent_cfg.get("ewc_lambda", 1000.0)
         ewc_online = agent_cfg.get("ewc_online", False)
         ewc_gamma = agent_cfg.get("ewc_gamma", 0.95)
-        cl_mem = ewc_memory.EWCMemory(
-            device=device, ewc_lambda=ewc_lambda,
-            online=ewc_online, gamma=ewc_gamma
-        )
+        if cl_method == "ewc_ref":
+            cl_mem = ewc_memory_ref.ReferenceEWCMemory(
+                device=device,
+                ewc_lambda=ewc_lambda,
+                online=ewc_online,
+                gamma=ewc_gamma,
+            )
+        else:
+            cl_mem = ewc_memory.EWCMemory(
+                device=device, ewc_lambda=ewc_lambda,
+                online=ewc_online, gamma=ewc_gamma
+            )
     else:
         assert False, "Unknown cl_method: {}".format(cl_method)
 
@@ -512,7 +736,7 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
                                         args.parse_string("sgp_memory_file", ""))
     if cl_memory_file != "":
         cl_mem.load(cl_memory_file)
-        if cl_method in ("gpm", "sgp"):
+        if cl_method in PROJECTION_METHODS:
             Logger.print("Loaded CL memory from {} ({} tasks)".format(
                 cl_memory_file, cl_mem.num_tasks))
         else:
@@ -532,8 +756,10 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
         record_video=first_stage_config["record_video"]
     )
 
-    # Performance matrix: perf_matrix[i] = {task_name: mean_ep_len} after stage i
-    perf_matrix = []
+    # Performance matrices after each stage for multiple scalar metrics.
+    perf_matrix_ep_len = []
+    perf_matrix_return = []
+    eval_rows_detailed = []
     stage_names = [s.get("name", "stage_{}".format(i))
                    for i, s in enumerate(stages[:end_stage + 1])]
 
@@ -571,11 +797,15 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
         stage_records.append(stage_record)
 
         # Evaluate all learned tasks after this stage
-        row = evaluate_after_stage(
+        eval_row = evaluate_after_stage(
             env, stages, stage_idx, out_model_file,
             device, curriculum, args
         )
-        perf_matrix.append(row)
+        eval_rows_detailed.append(eval_row)
+        perf_matrix_ep_len.append(extract_metric_row(eval_row, "mean_ep_len"))
+        perf_matrix_return.append(extract_metric_row(eval_row, "mean_return"))
+        stage_record["eval_after_stage"] = eval_row
+        cl_base.save_yaml(stage_record, os.path.join(stage_config["out_dir"], "stage_metrics.yaml"))
 
         # Restore motion for next stage training
         if stage_idx < end_stage:
@@ -584,18 +814,26 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
                 env._load_motions(next_motion)
 
     # Print full performance matrix and CL metrics
-    print_performance_matrix(perf_matrix, stage_names)
-    cl_metrics = compute_cl_metrics(perf_matrix, stage_names)
-    if cl_metrics:
-        Logger.print("CL Metrics:")
-        Logger.print("  Average Performance (AP): {:.1f}".format(cl_metrics["average_performance"]))
-        Logger.print("  Backward Transfer  (BWT): {:.1f}".format(cl_metrics["backward_transfer"]))
-        Logger.print("  Forgetting         (FGT): {:.1f}".format(cl_metrics["forgetting"]))
+    print_performance_matrix(perf_matrix_ep_len, stage_names, metric_name="mean_ep_len")
+    print_performance_matrix(perf_matrix_return, stage_names, metric_name="mean_return")
+
+    cl_metrics = {
+        "mean_ep_len": compute_cl_metrics(perf_matrix_ep_len, stage_names),
+        "mean_return": compute_cl_metrics(perf_matrix_return, stage_names),
+    }
+    for metric_name, metric_values in cl_metrics.items():
+        if metric_values:
+            Logger.print("CL Metrics [{}]:".format(metric_name))
+            Logger.print("  Average Performance (AP): {:.3f}".format(metric_values["average_performance"]))
+            Logger.print("  Backward Transfer  (BWT): {:.3f}".format(metric_values["backward_transfer"]))
+            Logger.print("  Forgetting         (FGT): {:.3f}".format(metric_values["forgetting"]))
 
     # Save performance matrix and metrics
     if mp_util.is_root_proc():
         matrix_data = {
-            "performance_matrix": perf_matrix,
+            "performance_matrix_ep_len": perf_matrix_ep_len,
+            "performance_matrix_return": perf_matrix_return,
+            "evaluation_rows_detailed": eval_rows_detailed,
             "stage_names": stage_names,
             "cl_metrics": cl_metrics,
         }

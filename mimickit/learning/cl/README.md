@@ -157,7 +157,7 @@ All standard AMP parameters (actor/critic/disc networks, learning rates, PPO hyp
 | `--rand_seed` | Random seed (auto-generated from time if not set) |
 | `--num_envs` | Override num_envs from curriculum |
 | `--max_samples` | Override max_samples per stage |
-| `--cl_method` / `--algorithm` / `--algo` | Override CL algorithm (`gpm`, `sgp`, `ewc`) |
+| `--cl_method` / `--algorithm` / `--algo` | Override CL algorithm (`gpm`, `sgp`, `ewc`, `gpm_ref`, `sgp_ref`, `ewc_ref`) |
 | `--optimizer` | Override all optimizer types at once |
 | `--actor_optimizer` | Override actor optimizer type |
 | `--critic_optimizer` | Override critic optimizer type |

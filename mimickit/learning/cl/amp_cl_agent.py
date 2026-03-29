@@ -28,6 +28,9 @@ import util.torch_util as torch_util
 import envs.base_env as base_env
 from util.logger import Logger
 
+PROJECTION_METHODS = ("gpm", "sgp", "gpm_ref", "sgp_ref")
+EWC_METHODS = ("ewc", "ewc_ref")
+
 
 class AMPCLAgent(amp_agent.AMPAgent):
     def __init__(self, config, env, device):
@@ -325,7 +328,7 @@ class AMPCLAgent(amp_agent.AMPAgent):
             info["action_reg_loss"] = action_reg_loss.detach()
 
         # EWC penalty
-        if self._cl_method == "ewc" and self._ewc_memory is not None:
+        if self._cl_method in EWC_METHODS and self._ewc_memory is not None:
             ewc_loss = self._ewc_memory.compute_ewc_loss(self)
             actor_loss += ewc_loss
             info["ewc_loss"] = ewc_loss.detach()
@@ -397,7 +400,7 @@ class AMPCLAgent(amp_agent.AMPAgent):
         For SGP: scaled projection via U @ diag(alpha) @ U^T.
         For EWC: no-op (EWC uses loss penalty instead).
         """
-        if self._cl_method == "ewc" or len(self._projection_data) == 0:
+        if self._cl_method in EWC_METHODS or len(self._projection_data) == 0:
             return
 
         kk = 0
@@ -539,7 +542,7 @@ class AMPCLAgent(amp_agent.AMPAgent):
             self._ewc_memory = ewc_memory
 
         # 5. Log projection info
-        if self._cl_method in ("gpm", "sgp") and self._projection_data:
+        if self._cl_method in PROJECTION_METHODS and self._projection_data:
             num_valid = sum(1 for p in self._projection_data if p is not None)
             Logger.print("{}: {} projection matrices loaded ({} valid)".format(
                 self._cl_method.upper(), len(self._projection_data), num_valid))

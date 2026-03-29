@@ -199,9 +199,10 @@ class ProjectionMemoryBank:
 
                 Ui = torch.cat([U_old, U[:, :r]], dim=1)
                 if Ui.shape[1] > Ui.shape[0]:
-                    self.feature_list[i] = Ui[:, :Ui.shape[0]].to(self.device)
-                else:
-                    self.feature_list[i] = Ui.to(self.device)
+                    Ui = Ui[:, :Ui.shape[0]]
+                # QR re-orthogonalizes in float32 to prevent numerical drift
+                Q, _ = torch.linalg.qr(Ui)
+                self.feature_list[i] = Q.to(self.device)
 
                 print("[CL:GPM] Layer {}: +{} dims, total={}/{}".format(
                     i, r, self.feature_list[i].shape[1],
@@ -296,16 +297,27 @@ class ProjectionMemoryBank:
                     importance[:r_old] = torch.clamp(
                         importance[:r_old] + imp_old[:r_old], 0, 1)
 
-                    Ui = torch.cat([U_old, U[:, :r]], dim=1)
-                    if Ui.shape[1] > Ui.shape[0]:
-                        self.feature_list[i] = Ui[:, :Ui.shape[0]].to(self.device)
-                        self.importance_list[i] = importance[:Ui.shape[0]].to(self.device)
-                    else:
-                        self.feature_list[i] = Ui.to(self.device)
-                        self.importance_list[i] = importance.to(self.device)
+                    # Preserve the old basis exactly so its per-column importance
+                    # remains well-defined. Only orthogonalize the newly added block.
+                    max_new_rank = max(0, U_old.shape[0] - r_old)
+                    new_block = U[:, : min(r, max_new_rank)]
+                    new_block, keep_mask = _orthonormalize_new_block(U_old, new_block)
+
+                    if new_block.shape[1] == 0:
+                        self.feature_list[i] = U_old.to(self.device)
+                        self.importance_list[i] = importance[:r_old].to(self.device)
+                        print("[CL:SGP] Layer {}: skip expand after re-orthogonalization".format(i))
+                        continue
+
+                    new_importance = importance[r_old:r_old + keep_mask.numel()][keep_mask]
+                    Ui = torch.cat([U_old, new_block], dim=1)
+                    importance = torch.cat([importance[:r_old], new_importance], dim=0).clamp(0.0, 1.0)
+
+                    self.feature_list[i] = Ui.to(self.device)
+                    self.importance_list[i] = importance.to(self.device)
 
                     print("[CL:SGP] Layer {}: +{} dims, total={}/{}, imp=[{:.4f},{:.4f}]".format(
-                        i, r, self.feature_list[i].shape[1],
+                        i, new_block.shape[1], self.feature_list[i].shape[1],
                         self.feature_list[i].shape[0],
                         self.importance_list[i].min().item(),
                         self.importance_list[i].max().item()))
@@ -476,25 +488,50 @@ class ProjectionMemoryBank:
 def _apply_projection(flat, data):
     """Apply projection to a flat [out_dim, in_dim] tensor.
 
-    For GPM (data is a P matrix): returns flat @ P.
-    For SGP (data is {"U", "alpha"}): returns flat @ U @ diag(alpha) @ U^T.
+    Returns the protected component flat @ M to subtract from gradients/weights.
+
+    For GPM: M = U @ U^T.
+    For SGP: M = U @ diag(alpha) @ U^T.
     """
-    if isinstance(data, dict):
-        U = data["U"].to(flat.device)
-        alpha = data["alpha"].to(flat.device)
-        proj = torch.mm(flat, U)
-        proj = proj * alpha.unsqueeze(0)
-        return torch.mm(proj, U.t())
-    else:
-        P = data.to(flat.device)
-        return torch.mm(flat, P)
+    M = get_projection_matrix(data)
+    if M is None:
+        return torch.zeros_like(flat)
+    return torch.mm(flat, M.to(flat.device))
+
+
+def _orthonormalize_new_block(U_old, U_new, tol=1e-6):
+    """Return a numerically cleaned new block while keeping the old basis fixed.
+
+    Args:
+        U_old: Existing orthonormal basis [feat_dim, r_old].
+        U_new: Candidate expansion directions [feat_dim, r_new].
+        tol: QR diagonal threshold used to drop numerically collapsed columns.
+
+    Returns:
+        tuple[Tensor, BoolTensor]: (orthonormalized_new_block, kept_column_mask).
+    """
+    if U_new.numel() == 0:
+        return U_new, torch.zeros(U_new.shape[1], dtype=torch.bool, device=U_new.device)
+
+    # Remove any drift back into the protected subspace before re-orthogonalizing.
+    U_new = U_new - U_old @ (U_old.t() @ U_new)
+
+    Q_new, R_new = torch.linalg.qr(U_new, mode='reduced')
+    diag = torch.diagonal(R_new, 0).abs()
+    keep = diag > tol
+
+    if not torch.any(keep):
+        return U_new[:, :0], keep
+
+    return Q_new[:, keep], keep
 
 
 def get_projection_matrix(data):
-    """Convert any projection data format to a dense P matrix (for CBP etc)."""
+    """Convert projection data to a dense protection matrix M."""
     if data is None:
         return None
     if isinstance(data, dict):
         U = data["U"]
-        return torch.mm(U, U.t())
+        alpha = data["alpha"].to(U.device)
+        return torch.mm(U * alpha.unsqueeze(0), U.t())
     return data

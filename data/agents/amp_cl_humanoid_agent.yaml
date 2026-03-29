@@ -6,7 +6,7 @@ enable_cbp: false
 cbp_replacement_rate: 1e-4
 cbp_maturity_threshold: 1000
 
-# CL method: "gpm", "sgp", or "ewc"
+# CL method: "gpm", "sgp", "ewc", "gpm_ref", "sgp_ref", or "ewc_ref"
 cl_method: "gpm"
 projection_threshold: 0.995
 projection_threshold_inc: 0.0

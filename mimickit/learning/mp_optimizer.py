@@ -1,5 +1,6 @@
 import torch
 
+import learning.cl.projection_memory as projection_memory
 import util.mp_util as mp_util
 
 class MPOptimizer():
@@ -169,15 +170,10 @@ class ProjectionAdamOptimizer():
         Handles both GPM (P matrix) and SGP ({"U", "alpha"} dict) formats.
         Returns the projected component (to be subtracted from flat).
         """
-        if isinstance(data, dict):
-            U = data["U"].to(flat.device)
-            alpha = data["alpha"].to(flat.device)
-            proj = torch.mm(flat, U)
-            proj = proj * alpha.unsqueeze(0)
-            return torch.mm(proj, U.t())
-        else:
-            P = data.to(flat.device)
-            return torch.mm(flat, P)
+        M = projection_memory.get_projection_matrix(data)
+        if M is None:
+            return torch.zeros_like(flat)
+        return torch.mm(flat, M.to(flat.device))
 
     def step(self, loss):
         for p in self._param_list:
