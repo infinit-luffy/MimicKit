@@ -9,6 +9,9 @@ cbp_maturity_threshold: 1000
 # CL method: "gpm", "sgp", "ewc", "gpm_ref", "sgp_ref", or "ewc_ref"
 cl_method: "gpm"
 projection_threshold: 0.995
+# compact_projection: use two-step (grad @ U) @ U^T instead of dense P = U @ U^T
+# More memory-efficient when rank r << input_dim. Only affects gpm method.
+compact_projection: false
 projection_threshold_inc: 0.0
 sgp_scale_coff: 25
 

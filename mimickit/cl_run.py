@@ -701,12 +701,14 @@ def run(rank, num_procs, device, master_port, args, rand_seed):
                 scale_coff=scale_coff,
             )
         else:
+            compact_projection = agent_cfg.get("compact_projection", False)
             cl_mem = projection_memory.ProjectionMemoryBank(
                 device=device,
                 threshold=threshold,
                 method=cl_method,
                 threshold_inc=threshold_inc,
                 scale_coff=scale_coff,
+                compact_projection=compact_projection,
             )
         Logger.print("Projection memory: threshold={}, threshold_inc={}, scale_coff={}".format(
             threshold, threshold_inc, scale_coff))

@@ -35,12 +35,16 @@ class ProjectionMemoryBank:
     """
 
     def __init__(self, device, threshold=0.98, method="gpm",
-                 threshold_inc=0.0, scale_coff=5):
+                 threshold_inc=0.0, scale_coff=5, compact_projection=False):
         self.device = device
         self.threshold = threshold
         self.threshold_inc = threshold_inc
         self.scale_coff = scale_coff
         self.method = method
+        # When True, GPM stores {"U": U} and projects via two-step matmul
+        # (grad @ U) @ U^T instead of materializing P = U @ U^T.
+        # More memory-efficient when rank r << input_dim n.
+        self.compact_projection = compact_projection
 
         # Per-layer basis (incrementally maintained)
         self.feature_list = []       # list[Tensor|None]: [feat_dim, rank] per layer
@@ -342,10 +346,15 @@ class ProjectionMemoryBank:
                 continue
 
             if self.method == "gpm":
-                P = torch.mm(U, U.t())
-                projection_data.append(P)
-                print("[CL:GPM] Layer {}: P {}, rank={}/{}".format(
-                    i, list(P.shape), U.shape[1], P.shape[0]))
+                if self.compact_projection:
+                    projection_data.append({"U": U})
+                    print("[CL:GPM] Layer {}: U {} (compact), rank={}/{}".format(
+                        i, list(U.shape), U.shape[1], U.shape[0]))
+                else:
+                    P = torch.mm(U, U.t())
+                    projection_data.append(P)
+                    print("[CL:GPM] Layer {}: P {}, rank={}/{}".format(
+                        i, list(P.shape), U.shape[1], P.shape[0]))
             else:  # sgp
                 imp = self.importance_list[i] if i < len(self.importance_list) else None
                 if imp is not None:
@@ -488,15 +497,25 @@ class ProjectionMemoryBank:
 def _apply_projection(flat, data):
     """Apply projection to a flat [out_dim, in_dim] tensor.
 
-    Returns the protected component flat @ M to subtract from gradients/weights.
+    Returns the protected component to subtract from gradients/weights.
 
-    For GPM: M = U @ U^T.
-    For SGP: M = U @ diag(alpha) @ U^T.
+    For GPM (dense):   flat @ P         where P = U @ U^T  [n,n]
+    For GPM (compact): (flat @ U) @ U^T  two-step, never materializes P
+    For SGP:           flat @ U @ diag(alpha) @ U^T
     """
-    M = get_projection_matrix(data)
-    if M is None:
+    if data is None:
         return torch.zeros_like(flat)
-    return torch.mm(flat, M.to(flat.device))
+    if isinstance(data, dict):
+        U = data["U"].to(flat.device)
+        if "alpha" not in data:
+            # Compact GPM: two-step matmul avoids [n,n] P matrix
+            return torch.mm(torch.mm(flat, U), U.t())
+        # SGP: U @ diag(alpha) @ U^T
+        alpha = data["alpha"].to(flat.device)
+        M = torch.mm(U * alpha.unsqueeze(0), U.t())
+        return torch.mm(flat, M)
+    # Dense P matrix (legacy GPM)
+    return torch.mm(flat, data.to(flat.device))
 
 
 def _orthonormalize_new_block(U_old, U_new, tol=1e-6):
@@ -527,11 +546,18 @@ def _orthonormalize_new_block(U_old, U_new, tol=1e-6):
 
 
 def get_projection_matrix(data):
-    """Convert projection data to a dense protection matrix M."""
+    """Convert projection data to a dense protection matrix M.
+
+    For compact GPM {"U": U}, materializes P = U @ U^T on demand.
+    Prefer _apply_projection() to avoid this when possible.
+    """
     if data is None:
         return None
     if isinstance(data, dict):
         U = data["U"]
+        if "alpha" not in data:
+            # Compact GPM: materialize P for callers that need a dense matrix
+            return torch.mm(U, U.t())
         alpha = data["alpha"].to(U.device)
         return torch.mm(U * alpha.unsqueeze(0), U.t())
     return data
