@@ -81,7 +81,7 @@ def parse_args():
     parser.add_argument(
         "--num_envs",
         type=int,
-        default=int(os.environ.get("NUM_ENVS", 64)),
+        default=int(os.environ.get("NUM_ENVS", 4096)),
         help="Number of environments.",
     )
     parser.add_argument(
