@@ -12,9 +12,25 @@ MIMICKIT_DIR = ROOT_DIR / "mimickit"
 ALGORITHMS = ("gpm", "sgp", "ewc", "gpm_ref", "sgp_ref", "ewc_ref")
 
 
+def resolve_repo_path(path_str):
+    path = Path(path_str)
+    if path.is_absolute():
+        return str(path)
+
+    root_candidate = (ROOT_DIR / path).resolve()
+    if root_candidate.exists():
+        return str(root_candidate)
+
+    mimickit_candidate = (MIMICKIT_DIR / path).resolve()
+    if mimickit_candidate.exists():
+        return str(mimickit_candidate)
+
+    return str(root_candidate)
+
+
 def build_common_args(args):
     common = [
-        "--curriculum_config", args.curriculum_config,
+        "--curriculum_config", resolve_repo_path(args.curriculum_config),
         "--rand_seed", str(args.rand_seed),
         "--num_envs", str(args.num_envs),
         "--max_samples", str(args.max_samples),
@@ -30,7 +46,7 @@ def build_command(args, algorithm):
     actor_optimizer = "Projection_Adam" if algorithm in ("gpm", "sgp", "gpm_ref", "sgp_ref") else "Adam"
     cmd = [
         sys.executable,
-        "cl_run.py",
+        str(MIMICKIT_DIR / "cl_run.py"),
         *build_common_args(args),
         "--cl_method", algorithm,
         "--actor_optimizer", actor_optimizer,
@@ -41,7 +57,7 @@ def build_command(args, algorithm):
 def run_one(args, algorithm):
     cmd = build_command(args, algorithm)
     print("Running:", " ".join(cmd))
-    subprocess.run(cmd, cwd=MIMICKIT_DIR, check=True)
+    subprocess.run(cmd, cwd=ROOT_DIR, check=True)
 
 
 def parse_args():
